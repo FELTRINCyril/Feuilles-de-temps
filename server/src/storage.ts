@@ -13,12 +13,22 @@ export class Storage {
     await fs.mkdir(this.dataDir, { recursive: true });
   }
 
-  private async atomicWrite(filePath: string, data: string): Promise<void> {
-    // Serialize writes to the same file to prevent races
+  /**
+   * Run fn with exclusive access to filePath: concurrent callers queue behind
+   * each other instead of interleaving. This is what makes read-modify-write
+   * safe (see withTimesheet) — without it two requests can both read the same
+   * state and the second one silently overwrites the first one's changes.
+   */
+  private async runExclusive<T>(filePath: string, fn: () => Promise<T>): Promise<T> {
     const prev = this.writeLocks.get(filePath) ?? Promise.resolve();
-    const current = prev.then(() => this.doAtomicWrite(filePath, data));
-    this.writeLocks.set(filePath, current.catch(() => {}));
-    await current;
+    // Run fn whether the previous op succeeded or failed, but never before it.
+    const op = prev.then(fn, fn);
+    this.writeLocks.set(filePath, op.then(() => {}, () => {}));
+    return op;
+  }
+
+  private async atomicWrite(filePath: string, data: string): Promise<void> {
+    await this.runExclusive(filePath, () => this.doAtomicWrite(filePath, data));
   }
 
   private async doAtomicWrite(filePath: string, data: string): Promise<void> {
@@ -158,17 +168,69 @@ export class Storage {
     );
   }
 
-  async withTimesheet(date: string, fn: (data: TimesheetDay) => void | Promise<void>): Promise<TimesheetDay> {
+  /**
+   * Read-modify-write a day file under an exclusive lock: the only safe way to
+   * mutate a timesheet. Every route must go through this rather than
+   * loadTimesheet + saveTimesheet, which can lose concurrent updates.
+   *
+   * Return false from fn to skip the write (e.g. entry not found).
+   */
+  async withTimesheet(
+    date: string,
+    fn: (data: TimesheetDay) => boolean | void | Promise<boolean | void>,
+  ): Promise<TimesheetDay> {
+    await this.ensureDir();
     const filePath = path.join(this.dataDir, `${date}.json`);
-    // Reuse the same lock mechanism as atomicWrite
-    const prev = this.writeLocks.get(filePath) ?? Promise.resolve();
-    const op = prev.then(async () => {
+    return this.runExclusive(filePath, async () => {
       const data = await this.loadTimesheet(date);
-      await fn(data);
-      await fs.writeFile(filePath, JSON.stringify(data, null, 2));
+      const result = await fn(data);
+      if (result !== false) {
+        await this.doAtomicWrite(filePath, JSON.stringify(data, null, 2));
+      }
       return data;
     });
-    this.writeLocks.set(filePath, op.then(() => {}, () => {}));
-    return op;
+  }
+
+  /**
+   * Whether any recorded entry points at this activity. Soft-deleted entries
+   * count as users: they can be restored and would need their label back.
+   */
+  async isActivityUsed(activityId: string): Promise<boolean> {
+    if (!activityId) return false;
+    for (const date of await this.listDates()) {
+      const day = await this.loadTimesheet(date);
+      if (day.entries.some((e) => e.activityId === activityId)) return true;
+    }
+    return false;
+  }
+
+  /** The n most recent dates that have a day file, oldest first. */
+  async recentDates(n: number): Promise<string[]> {
+    const dates = await this.listDates();
+    return dates.slice(-n);
+  }
+
+  /**
+   * lastSeenAt is refreshed periodically while the app runs. On startup it tells
+   * us when the app was last known to be alive, so a segment left open by a
+   * quit/crash/battery-death can be closed there instead of counting the whole
+   * downtime as worked time.
+   */
+  async readRuntime(): Promise<{ lastSeenAt?: string }> {
+    try {
+      const raw = await fs.readFile(path.join(this.dataDir, 'runtime.json'), 'utf-8');
+      return JSON.parse(raw);
+    } catch (err: any) {
+      if (err.code === 'ENOENT') return {};
+      throw err;
+    }
+  }
+
+  async touchRuntime(at: string): Promise<void> {
+    await this.ensureDir();
+    await this.atomicWrite(
+      path.join(this.dataDir, 'runtime.json'),
+      JSON.stringify({ lastSeenAt: at }, null, 2),
+    );
   }
 }

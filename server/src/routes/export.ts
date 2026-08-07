@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import type { Response } from 'express';
 import type { Storage } from '../storage.js';
 import type { TimesheetEntry } from '../types.js';
 import { toHHmm } from '../time-utils.js';
@@ -10,53 +11,57 @@ export function createExportRouter(storage: Storage) {
     const activities = await storage.loadActivities();
     const customers = await storage.loadCustomers();
     const day = await storage.loadTimesheet(req.params.date);
-    const csv = buildCsv(day.entries, activities.activities, customers.customers, day.date);
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', `attachment; filename=timesheet-${req.params.date}.csv`);
-    res.send(csv);
+    const rows = exportable(day.entries).map((e) =>
+      entryToCsvRow(e, activities.activities, customers.customers, day.date),
+    );
+    sendCsv(res, `timesheet-${req.params.date}.csv`, rows);
   });
 
   router.get('/', async (req, res) => {
     const { from, to } = req.query as { from: string; to: string };
     const activities = await storage.loadActivities();
     const customers = await storage.loadCustomers();
-    let allRows: string[] = [];
+    const allRows: string[] = [];
 
-    const start = new Date(from + 'T00:00:00');
-    const end = new Date(to + 'T00:00:00');
-    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-      const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    // Only the days that actually exist, instead of walking the calendar.
+    const dates = (await storage.listDates()).filter((d) => d >= from && d <= to);
+    for (const dateStr of dates) {
       const day = await storage.loadTimesheet(dateStr);
-      if (day.entries.length > 0) {
-        allRows.push(
-          ...day.entries.map((e) => entryToCsvRow(e, activities.activities, customers.customers, dateStr)),
-        );
-      }
+      allRows.push(
+        ...exportable(day.entries).map((e) =>
+          entryToCsvRow(e, activities.activities, customers.customers, dateStr),
+        ),
+      );
     }
 
-    const csv = CSV_HEADER + '\n' + allRows.join('\n');
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', `attachment; filename=timesheet-${from}-to-${to}.csv`);
-    res.send(csv);
+    sendCsv(res, `timesheet-${from}-to-${to}.csv`, allRows);
   });
 
   return router;
 }
 
-const CSV_HEADER =
-  'Date,Client,Type,Activité,Description,Heure début,Heure fin,Durée réelle (min),Durée arrondie (min),Segments,Interruptions';
+const SEP = ';';
+
+const CSV_COLUMNS = [
+  'Date', 'Client', 'Type', 'Activité', 'Description', 'Heure début', 'Heure fin',
+  'Durée réelle (min)', 'Durée arrondie (min)', 'Segments', 'Interruptions', 'À reporter',
+];
 
 interface ActivityRow { id: string; name: string; customerId: string }
 interface CustomerRow { id: string; name: string; type: string }
 
-function buildCsv(
-  entries: TimesheetEntry[],
-  activities: ActivityRow[],
-  customers: CustomerRow[],
-  date: string,
-): string {
-  const rows = entries.map((e) => entryToCsvRow(e, activities, customers, date));
-  return CSV_HEADER + '\n' + rows.join('\n');
+/** Deleted entries are hidden, and a running or paused timer has no final duration. */
+function exportable(entries: TimesheetEntry[]): TimesheetEntry[] {
+  return entries.filter((e) => !e.deleted && e.status === 'completed');
+}
+
+function sendCsv(res: Response, filename: string, rows: string[]): void {
+  const csv = [CSV_COLUMNS.join(SEP), ...rows].join('\r\n');
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename=${filename}`);
+  // UTF-8 BOM: without it Excel (fr) mangles the accents. CRLF + ';' so it also
+  // splits the columns without an import wizard.
+  res.send('﻿' + csv + '\r\n');
 }
 
 function entryToCsvRow(
@@ -67,15 +72,16 @@ function entryToCsvRow(
 ): string {
   const activity = activities.find((a) => a.id === entry.activityId);
   const customer = activity ? customers.find((c) => c.id === activity.customerId) : undefined;
+  const closed = entry.segments.filter((s) => s.end);
   const firstStart = entry.segments[0]?.start ? toHHmm(entry.segments[0].start) : '';
-  const lastEnd = entry.segments[entry.segments.length - 1]?.end ? toHHmm(entry.segments[entry.segments.length - 1].end!) : '';
+  const lastEnd = closed.length > 0 ? toHHmm(closed[closed.length - 1].end!) : '';
   const interruptions = Math.max(0, entry.segments.length - 1);
 
   return [
     date,
     csvEscape(customer?.name ?? ''),
     customer?.type ?? '',
-    csvEscape(activity?.name ?? entry.activityId),
+    csvEscape(activity?.name ?? (entry.activityId ? '(activité supprimée)' : '')),
     csvEscape(entry.description),
     firstStart,
     lastEnd,
@@ -83,12 +89,15 @@ function entryToCsvRow(
     entry.roundedMinutes,
     entry.segments.length,
     interruptions,
-  ].join(',');
+    entry.deferred ? 'oui' : '',
+  ].join(SEP);
 }
 
 function csvEscape(value: string): string {
-  if (value.includes(',') || value.includes('"') || value.includes('\n')) {
-    return `"${value.replace(/"/g, '""')}"`;
+  // A leading =, +, - or @ makes Excel treat the cell as a formula.
+  const safe = /^[=+\-@]/.test(value) ? `'${value}` : value;
+  if (safe.includes(SEP) || safe.includes('"') || /[\r\n]/.test(safe)) {
+    return `"${safe.replace(/"/g, '""')}"`;
   }
-  return value;
+  return safe;
 }

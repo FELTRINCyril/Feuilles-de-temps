@@ -23,16 +23,43 @@ export function createCustomersRouter(storage: Storage) {
     const data = await storage.loadCustomers();
     const customer = data.customers.find((c) => c.id === req.params.id);
     if (!customer) return res.status(404).json({ error: 'Not found' });
-    Object.assign(customer, req.body, { id: customer.id });
+    if (typeof req.body.name === 'string') customer.name = req.body.name;
+    if (req.body.type === 'interne' || req.body.type === 'externe') customer.type = req.body.type;
+    if (req.body.archived !== undefined) {
+      if (req.body.archived) customer.archived = true;
+      else delete customer.archived;
+    }
     await storage.saveCustomers(data);
     res.json(customer);
   });
 
+  // Same rule as activities: a customer referenced by past entries is archived,
+  // never removed, so history keeps its labels. Its activities follow.
   router.delete('/:id', async (req, res) => {
-    const data = await storage.loadCustomers();
-    data.customers = data.customers.filter((c) => c.id !== req.params.id);
-    await storage.saveCustomers(data);
-    res.status(204).end();
+    const custData = await storage.loadCustomers();
+    const customer = custData.customers.find((c) => c.id === req.params.id);
+    if (!customer) return res.status(204).end();
+
+    const actData = await storage.loadActivities();
+    const own = actData.activities.filter((a) => a.customerId === req.params.id);
+    const used: string[] = [];
+    for (const a of own) {
+      if (await storage.isActivityUsed(a.id)) used.push(a.id);
+    }
+
+    if (used.length > 0) {
+      customer.archived = true;
+      for (const a of own) a.archived = true;
+      await storage.saveActivities(actData);
+      await storage.saveCustomers(custData);
+      return res.json({ archived: true });
+    }
+
+    actData.activities = actData.activities.filter((a) => a.customerId !== req.params.id);
+    custData.customers = custData.customers.filter((c) => c.id !== req.params.id);
+    await storage.saveActivities(actData);
+    await storage.saveCustomers(custData);
+    res.json({ archived: false });
   });
 
   return router;

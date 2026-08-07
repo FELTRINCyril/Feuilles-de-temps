@@ -13,43 +13,53 @@ export function createTimesheetRouter(storage: Storage) {
   });
 
   router.post('/:date/entries', async (req, res) => {
-    const data = await storage.loadTimesheet(req.params.date);
     const { activityId = '', description = '' } = req.body;
 
     const entry: TimesheetEntry = {
       id: uuid(),
-      activityId,
-      description,
+      activityId: typeof activityId === 'string' ? activityId : '',
+      description: typeof description === 'string' ? description : '',
       segments: [{ start: nowTimestamp(), end: null }],
       totalMinutes: 0,
       roundedMinutes: 0,
       status: 'active',
     };
 
-    data.entries.push(entry);
-    data.activeEntries.push(entry.id);
-    await storage.saveTimesheet(data);
+    const data = await storage.withTimesheet(req.params.date, (d) => {
+      d.entries.push(entry);
+      d.activeEntries.push(entry.id);
+    });
     res.status(201).json(data);
   });
 
   router.patch('/:date/entries/:id', async (req, res) => {
-    const data = await storage.loadTimesheet(req.params.date);
-    const entry = data.entries.find((e) => e.id === req.params.id);
-    if (!entry) return res.status(404).json({ error: 'Not found' });
+    let found = false;
+    const data = await storage.withTimesheet(req.params.date, (d) => {
+      const entry = d.entries.find((e) => e.id === req.params.id);
+      if (!entry) return false;
+      found = true;
 
-    if (req.body.status === 'completed') {
-      const openSeg = entry.segments.find((s) => s.end === null);
-      if (openSeg) openSeg.end = nowTimestamp();
-      entry.totalMinutes = calcTotalMinutes(entry.segments);
-      entry.roundedMinutes = roundUp15(entry.totalMinutes);
-      entry.status = 'completed';
-      data.activeEntries = data.activeEntries.filter((id) => id !== entry.id);
-      data.pausedEntries = data.pausedEntries.filter((id) => id !== entry.id);
-    } else {
-      if (req.body.description !== undefined) entry.description = req.body.description;
-      if (req.body.roundedMinutes !== undefined) entry.roundedMinutes = req.body.roundedMinutes;
-      if (req.body.activityId !== undefined) entry.activityId = req.body.activityId;
-      if (req.body.deferred !== undefined) entry.deferred = req.body.deferred;
+      if (req.body.status === 'completed') {
+        const openSeg = entry.segments.find((s) => s.end === null);
+        if (openSeg) openSeg.end = nowTimestamp();
+        entry.totalMinutes = calcTotalMinutes(entry.segments);
+        entry.roundedMinutes = roundUp15(entry.totalMinutes);
+        entry.status = 'completed';
+        delete entry.autoPausedAt;
+        delete entry.autoPauseReason;
+        d.activeEntries = d.activeEntries.filter((id) => id !== entry.id);
+        d.pausedEntries = d.pausedEntries.filter((id) => id !== entry.id);
+        return;
+      }
+
+      if (typeof req.body.description === 'string') entry.description = req.body.description;
+      if (typeof req.body.activityId === 'string') entry.activityId = req.body.activityId;
+      if (req.body.deferred !== undefined) entry.deferred = !!req.body.deferred;
+
+      if (req.body.roundedMinutes !== undefined) {
+        const rounded = Math.round(Number(req.body.roundedMinutes));
+        if (Number.isFinite(rounded) && rounded >= 0) entry.roundedMinutes = rounded;
+      }
 
       // Manual duration edit on an entry with no running segment (e.g. paused).
       // Rewrite the segments to a single one of that length so the edit survives
@@ -65,51 +75,107 @@ export function createTimesheetRouter(storage: Storage) {
           entry.roundedMinutes = roundUp15(mins);
         }
       }
-    }
+    });
 
-    await storage.saveTimesheet(data);
+    if (!found) return res.status(404).json({ error: 'Not found' });
     res.json(data);
   });
 
+  // Soft delete: the entry is flagged, never removed from the file, so it can
+  // always be restored (see /restore below).
   router.delete('/:date/entries/:id', async (req, res) => {
-    const data = await storage.loadTimesheet(req.params.date);
-    data.entries = data.entries.filter((e) => e.id !== req.params.id);
-    data.activeEntries = data.activeEntries.filter((id) => id !== req.params.id);
-    data.pausedEntries = data.pausedEntries.filter((id) => id !== req.params.id);
-    await storage.saveTimesheet(data);
+    const data = await storage.withTimesheet(req.params.date, (d) => {
+      const entry = d.entries.find((e) => e.id === req.params.id);
+      if (!entry) return false;
+      const openSeg = entry.segments.find((s) => s.end === null);
+      if (openSeg) openSeg.end = nowTimestamp();
+      entry.totalMinutes = calcTotalMinutes(entry.segments);
+      entry.deleted = true;
+      d.activeEntries = d.activeEntries.filter((id) => id !== entry.id);
+      d.pausedEntries = d.pausedEntries.filter((id) => id !== entry.id);
+    });
+    res.json(data);
+  });
+
+  router.post('/:date/entries/:id/restore', async (req, res) => {
+    let found = false;
+    const data = await storage.withTimesheet(req.params.date, (d) => {
+      const entry = d.entries.find((e) => e.id === req.params.id);
+      if (!entry) return false;
+      found = true;
+      delete entry.deleted;
+      // A restored entry comes back paused: its timer was stopped on delete and
+      // we must not invent the time that passed in between.
+      if (entry.status !== 'completed') {
+        entry.status = 'paused';
+        if (!d.pausedEntries.includes(entry.id)) d.pausedEntries.push(entry.id);
+      }
+    });
+    if (!found) return res.status(404).json({ error: 'Not found' });
+    res.json(data);
+  });
+
+  // Hard delete: actually removes the entry. Only allowed once it's already
+  // in the trash (soft-deleted), so this is "empty the trash", not a shortcut
+  // that bypasses the undo safety net on a live entry.
+  router.delete('/:date/entries/:id/purge', async (req, res) => {
+    let found = false;
+    let notDeleted = false;
+    const data = await storage.withTimesheet(req.params.date, (d) => {
+      const entry = d.entries.find((e) => e.id === req.params.id);
+      if (!entry) return false;
+      if (!entry.deleted) {
+        notDeleted = true;
+        return false;
+      }
+      found = true;
+      d.entries = d.entries.filter((e) => e.id !== req.params.id);
+    });
+    if (notDeleted) return res.status(400).json({ error: 'Entry must be soft-deleted before it can be purged' });
+    if (!found) return res.status(404).json({ error: 'Not found' });
     res.json(data);
   });
 
   router.post('/:date/entries/:id/pause', async (req, res) => {
-    const data = await storage.loadTimesheet(req.params.date);
-    const entry = data.entries.find((e) => e.id === req.params.id);
-    if (!entry) return res.status(404).json({ error: 'Not found' });
+    let found = false;
+    const data = await storage.withTimesheet(req.params.date, (d) => {
+      const entry = d.entries.find((e) => e.id === req.params.id);
+      if (!entry) return false;
+      found = true;
 
-    const openSeg = entry.segments.find((s) => s.end === null);
-    if (openSeg) openSeg.end = nowTimestamp();
-    entry.totalMinutes = calcTotalMinutes(entry.segments);
-    entry.status = 'paused';
+      const openSeg = entry.segments.find((s) => s.end === null);
+      if (openSeg) openSeg.end = nowTimestamp();
+      entry.totalMinutes = calcTotalMinutes(entry.segments);
+      entry.status = 'paused';
+      // A manual pause clears any "paused by the system" marker.
+      delete entry.autoPausedAt;
+      delete entry.autoPauseReason;
 
-    data.activeEntries = data.activeEntries.filter((id) => id !== entry.id);
-    if (!data.pausedEntries.includes(entry.id)) {
-      data.pausedEntries.push(entry.id);
-    }
+      d.activeEntries = d.activeEntries.filter((id) => id !== entry.id);
+      if (!d.pausedEntries.includes(entry.id)) d.pausedEntries.push(entry.id);
+    });
 
-    await storage.saveTimesheet(data);
+    if (!found) return res.status(404).json({ error: 'Not found' });
     res.json(data);
   });
 
   router.post('/:date/entries/:id/resume', async (req, res) => {
-    const data = await storage.loadTimesheet(req.params.date);
-    const entry = data.entries.find((e) => e.id === req.params.id);
-    if (!entry) return res.status(404).json({ error: 'Not found' });
+    let found = false;
+    const data = await storage.withTimesheet(req.params.date, (d) => {
+      const entry = d.entries.find((e) => e.id === req.params.id);
+      if (!entry) return false;
+      found = true;
 
-    entry.segments.push({ start: nowTimestamp(), end: null });
-    entry.status = 'active';
-    if (!data.activeEntries.includes(entry.id)) data.activeEntries.push(entry.id);
-    data.pausedEntries = data.pausedEntries.filter((id) => id !== entry.id);
+      entry.segments.push({ start: nowTimestamp(), end: null });
+      entry.status = 'active';
+      delete entry.autoPausedAt;
+      delete entry.autoPauseReason;
+      delete entry.recoveredAt;
+      if (!d.activeEntries.includes(entry.id)) d.activeEntries.push(entry.id);
+      d.pausedEntries = d.pausedEntries.filter((id) => id !== entry.id);
+    });
 
-    await storage.saveTimesheet(data);
+    if (!found) return res.status(404).json({ error: 'Not found' });
     res.json(data);
   });
 
@@ -118,54 +184,84 @@ export function createTimesheetRouter(storage: Storage) {
   // first make sure the closed segments actually reflect totalMinutes (merged or
   // manually-edited entries may carry placeholder segments), then add an open one.
   router.post('/:date/entries/:id/reopen', async (req, res) => {
-    const data = await storage.loadTimesheet(req.params.date);
-    const entry = data.entries.find((e) => e.id === req.params.id);
-    if (!entry) return res.status(404).json({ error: 'Not found' });
+    let found = false;
+    const data = await storage.withTimesheet(req.params.date, (d) => {
+      const entry = d.entries.find((e) => e.id === req.params.id);
+      if (!entry) return false;
+      found = true;
 
-    const closedTotal = calcTotalMinutes(entry.segments);
-    if (closedTotal !== entry.totalMinutes) {
-      const start = entry.segments[0]?.start ?? new Date(Date.now() - entry.totalMinutes * 60000).toISOString();
-      const end = new Date(new Date(start).getTime() + entry.totalMinutes * 60000).toISOString();
-      entry.segments = [{ start, end }];
-    }
-    entry.segments.push({ start: nowTimestamp(), end: null });
-    entry.status = 'active';
-    if (!data.activeEntries.includes(entry.id)) data.activeEntries.push(entry.id);
-    data.pausedEntries = data.pausedEntries.filter((id) => id !== entry.id);
+      const closedTotal = calcTotalMinutes(entry.segments);
+      if (closedTotal !== entry.totalMinutes) {
+        const start = entry.segments[0]?.start ?? new Date(Date.now() - entry.totalMinutes * 60000).toISOString();
+        const end = new Date(new Date(start).getTime() + entry.totalMinutes * 60000).toISOString();
+        entry.segments = [{ start, end }];
+      }
+      entry.segments.push({ start: nowTimestamp(), end: null });
+      entry.status = 'active';
+      if (!d.activeEntries.includes(entry.id)) d.activeEntries.push(entry.id);
+      d.pausedEntries = d.pausedEntries.filter((id) => id !== entry.id);
+    });
 
-    await storage.saveTimesheet(data);
+    if (!found) return res.status(404).json({ error: 'Not found' });
     res.json(data);
   });
 
-  // Merge: create a completed entry and delete originals
+  // Merge: create a completed entry that keeps the real time span of the
+  // originals, and soft-delete the originals so the merge can be undone.
   router.post('/:date/entries/merge', async (req, res) => {
-    const data = await storage.loadTimesheet(req.params.date);
-    const { entryIds, activityId, description, totalMinutes, roundedMinutes } = req.body;
+    const { entryIds, activityId, description } = req.body;
 
     if (!Array.isArray(entryIds) || entryIds.length < 2) {
       return res.status(400).json({ error: 'Need at least 2 entry IDs' });
     }
 
-    // Create merged entry (already completed, no active segments)
-    const now = nowTimestamp();
-    const merged: TimesheetEntry = {
-      id: uuid(),
-      activityId: activityId ?? '',
-      description: description ?? '',
-      segments: [{ start: now, end: now }],
-      totalMinutes: totalMinutes ?? 0,
-      roundedMinutes: roundedMinutes ?? 0,
-      status: 'completed',
-    };
-    data.entries.push(merged);
+    let error: string | null = null;
+    const data = await storage.withTimesheet(req.params.date, (d) => {
+      const ids = new Set(entryIds as string[]);
+      const originals = d.entries.filter((e) => ids.has(e.id) && !e.deleted);
+      if (originals.length < 2) {
+        error = 'Entries not found';
+        return false;
+      }
 
-    // Remove original entries
-    const idsToRemove = new Set(entryIds as string[]);
-    data.entries = data.entries.filter(e => !idsToRemove.has(e.id) || e.id === merged.id);
-    data.activeEntries = data.activeEntries.filter(id => !idsToRemove.has(id));
-    data.pausedEntries = data.pausedEntries.filter(id => !idsToRemove.has(id));
+      // Durations come from the stored entries, never from the client.
+      const total = originals.reduce((sum, e) => {
+        const useIndicated = Array.isArray(req.body.useIndicated)
+          && req.body.useIndicated.includes(e.id);
+        return sum + (useIndicated ? e.roundedMinutes : e.totalMinutes);
+      }, 0);
 
-    await storage.saveTimesheet(data);
+      // Keep the real span: earliest start, latest end of the merged entries.
+      const starts = originals.flatMap((e) => e.segments.map((s) => s.start)).sort();
+      const ends = originals
+        .flatMap((e) => e.segments.map((s) => s.end))
+        .filter((v): v is string => !!v)
+        .sort();
+      const start = starts[0] ?? nowTimestamp();
+      const end = ends[ends.length - 1] ?? start;
+
+      const merged: TimesheetEntry = {
+        id: uuid(),
+        activityId: typeof activityId === 'string' ? activityId : '',
+        description: typeof description === 'string' ? description : '',
+        segments: [{ start, end }],
+        totalMinutes: total,
+        roundedMinutes: roundUp15(total),
+        status: 'completed',
+      };
+      // Carry over the "to report in Odoo" flag if any original had it.
+      if (originals.some((e) => e.deferred)) merged.deferred = true;
+
+      d.entries.push(merged);
+
+      for (const e of originals) {
+        e.deleted = true;
+      }
+      d.activeEntries = d.activeEntries.filter((id) => !ids.has(id));
+      d.pausedEntries = d.pausedEntries.filter((id) => !ids.has(id));
+    });
+
+    if (error) return res.status(404).json({ error });
     res.status(201).json(data);
   });
 

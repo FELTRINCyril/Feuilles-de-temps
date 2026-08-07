@@ -27,6 +27,16 @@ export default function SettingsPage() {
   const [newCustActivities, setNewCustActivities] = useState<Set<string>>(new Set());
   const [newCategoryName, setNewCategoryName] = useState('');
 
+  const [notice, setNotice] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  // Hidden by default so old, no-longer-used clients/activities don't clutter
+  // the list; a setting here is the only way to see them again.
+  const [showArchived, setShowArchived] = useState(() => localStorage.getItem('showArchived') === '1');
+  useEffect(() => {
+    localStorage.setItem('showArchived', showArchived ? '1' : '0');
+  }, [showArchived]);
+
   // Activity categories
   const defaultCategories = ['Odoo', 'Web', 'Dev', 'Interne', 'Support', 'Gestion de projet', 'Formation', 'Divers'];
   const existingNames = [...new Set(activities.activities.map(a => a.name))];
@@ -39,9 +49,14 @@ export default function SettingsPage() {
   const [updateUrl, setUpdateUrl] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
-    const [a, c] = await Promise.all([api.getActivities(), api.getCustomers()]);
-    setActivities(a);
-    setCustomers(c);
+    try {
+      const [a, c] = await Promise.all([api.getActivities(), api.getCustomers()]);
+      setActivities(a);
+      setCustomers(c);
+      setLoadError(null);
+    } catch {
+      setLoadError("Impossible de contacter le serveur local. Vérifiez que l'application est bien lancée.");
+    }
   }, []);
 
   useEffect(() => { refresh(); }, [refresh]);
@@ -108,15 +123,25 @@ export default function SettingsPage() {
 
   // --- Activities ---
   function getCustomerActivities(customerId: string): Activity[] {
-    return activities.activities.filter(a => a.customerId === customerId);
+    return activities.activities.filter(a => a.customerId === customerId && (showArchived || !a.archived));
   }
 
   async function toggleActivity(customerId: string, activityName: string) {
     const existing = activities.activities.find(a => a.customerId === customerId && a.name === activityName);
-    if (existing) {
-      await api.deleteActivity(existing.id);
-    } else {
+    if (!existing) {
       await api.createActivity({ name: activityName, customerId });
+    } else if (existing.archived) {
+      // Re-enabling an activity that history still points at
+      await api.updateActivity(existing.id, { archived: false });
+    } else {
+      // The server archives instead of deleting when past entries use it, so no
+      // timesheet ever loses its label.
+      const res = await api.deleteActivity(existing.id);
+      setNotice(
+        res.archived
+          ? `"${activityName}" est utilisée par des feuilles de temps existantes : elle a été archivée (retirée des listes, conservée dans l'historique).`
+          : null,
+      );
     }
     refresh();
   }
@@ -134,12 +159,33 @@ export default function SettingsPage() {
   const custTypes: CustomerType[] = ['externe', 'interne'];
   const typeLabel = (t: string) => t.charAt(0).toUpperCase() + t.slice(1);
 
+  // Archived customers are hidden by default (the "showArchived" setting brings
+  // them back, sorted to the end) so they don't clutter the list for nothing.
   const filteredCustomers = [...customers.customers]
-    .sort((a, b) => a.name.localeCompare(b.name, 'fr'))
+    .filter(c => showArchived || !c.archived)
+    .sort((a, b) => Number(!!a.archived) - Number(!!b.archived) || a.name.localeCompare(b.name, 'fr'))
     .filter(c => !searchQuery || c.name.toLowerCase().includes(searchQuery.toLowerCase()));
 
   return (
     <div className="space-y-6 animate-in fade-in duration-200">
+      {loadError && (
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2.5">
+          <p className="text-sm text-destructive">{loadError}</p>
+          <Button variant="outline" size="sm" onClick={() => refresh()}>Réessayer</Button>
+        </div>
+      )}
+      {notice && (
+        <div className="flex items-start justify-between gap-3 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2.5">
+          <p className="text-sm text-foreground">{notice}</p>
+          <button
+            onClick={() => setNotice(null)}
+            className="shrink-0 text-muted-foreground hover:text-foreground"
+            title="Fermer"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
       {!editingCust && (
         <section className="space-y-4">
           {/* Page header */}
@@ -156,8 +202,9 @@ export default function SettingsPage() {
             </Button>
           </div>
 
-          {/* Search */}
-          <div className="relative max-w-sm">
+          {/* Search + archived toggle */}
+          <div className="flex items-center gap-3 flex-wrap">
+          <div className="relative max-w-sm flex-1 min-w-[16rem]">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
             <Input
               placeholder="Rechercher un client..."
@@ -173,6 +220,16 @@ export default function SettingsPage() {
                 <X className="h-4 w-4" />
               </button>
             )}
+          </div>
+          <label className="flex items-center gap-2 text-sm text-muted-foreground shrink-0 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={showArchived}
+              onChange={(e) => setShowArchived(e.target.checked)}
+              className="h-3.5 w-3.5 rounded border-border accent-primary cursor-pointer"
+            />
+            Afficher les archivés
+          </label>
           </div>
 
           {/* Client list (Vercel-style rows) */}
@@ -190,8 +247,13 @@ export default function SettingsPage() {
                       className={`h-2 w-2 rounded-full shrink-0 ${c.type === 'interne' ? 'bg-tempo' : 'bg-success'}`}
                       aria-hidden="true"
                     />
-                    <span className="text-sm font-medium truncate">{c.name}</span>
+                    <span className={`text-sm font-medium truncate ${c.archived ? 'text-muted-foreground' : ''}`}>{c.name}</span>
                     <span className="text-xs text-muted-foreground shrink-0">{typeLabel(c.type)}</span>
+                    {c.archived && (
+                      <span className="text-xs shrink-0 rounded border border-border px-1.5 py-0.5 text-muted-foreground">
+                        Archivé
+                      </span>
+                    )}
                   </div>
                   <div className="flex items-center gap-3 min-w-0 shrink">
                     <span className="text-xs text-muted-foreground truncate">
@@ -306,7 +368,9 @@ export default function SettingsPage() {
             <h3 className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Activités facturables</h3>
             <div className="flex flex-wrap gap-1.5">
               {activityCategories.map((name) => {
-                const isActive = activities.activities.some(a => a.customerId === editingCust.id && a.name === name);
+                const isActive = activities.activities.some(
+                  a => a.customerId === editingCust.id && a.name === name && !a.archived,
+                );
                 return (
                   <button
                     key={name}
@@ -349,19 +413,38 @@ export default function SettingsPage() {
           </div>
 
           {/* Danger zone */}
-          <div className="pt-4 border-t border-border">
+          <div className="pt-4 border-t border-border flex items-center gap-2">
+            {editingCust.archived && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={async () => {
+                  await api.updateCustomer(editingCust.id, { archived: false });
+                  setEditingCust({ ...editingCust, archived: false });
+                  setNotice(null);
+                  refresh();
+                }}
+              >
+                Désarchiver ce client
+              </Button>
+            )}
             <Button
               variant="ghost"
               size="sm"
               className="text-destructive hover:text-destructive hover:bg-destructive/10"
               onClick={async () => {
-                if (!confirm(`Supprimer le client "${editingCust.name}" et toutes ses activités ?`)) return;
-                // Delete all activities for this customer first
-                const custActs = activities.activities.filter(a => a.customerId === editingCust.id);
-                for (const a of custActs) {
-                  await api.deleteActivity(a.id);
-                }
-                await api.deleteCustomer(editingCust.id);
+                if (!confirm(
+                  `Supprimer le client "${editingCust.name}" ?\n\n`
+                  + "S'il est utilisé par des feuilles de temps existantes, il sera archivé "
+                  + "(retiré des listes, conservé dans l'historique) plutôt que supprimé.",
+                )) return;
+                // The server handles the cascade and decides delete vs archive
+                const res = await api.deleteCustomer(editingCust.id);
+                setNotice(
+                  res.archived
+                    ? `"${editingCust.name}" est utilisé par des feuilles de temps existantes : le client et ses activités ont été archivés.`
+                    : null,
+                );
                 setEditingCust(null);
                 refresh();
               }}

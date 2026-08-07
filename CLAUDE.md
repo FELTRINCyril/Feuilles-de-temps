@@ -56,13 +56,38 @@ cd server && npx vitest src/__tests__/timesheet.test.ts
 
 ## Data Model
 
-- **Projects:** `{ id, name, category: 'client'|'interne'|'support', tasks: [{ id, name }] }`
-- **Timesheet entries:** `{ id, projectId, taskId, description, segments: [{ start, end }], totalMinutes, roundedMinutes, status: 'active'|'paused'|'completed' }`
+- **Customers:** `{ id, name, type: 'interne'|'externe', archived? }` in `customers.json`
+- **Activities:** `{ id, name, customerId, archived? }` in `activities.json` (migrated from the legacy `projects.json`)
+- **Timesheet entries:** `{ id, activityId, description, segments: [{ start, end }], totalMinutes, roundedMinutes, status: 'active'|'paused'|'completed', deferred?, deleted?, autoPausedAt?, autoPauseReason?, recoveredAt?, splitAtMidnight?, continuedFrom? }`
 - **Day file:** `{ date, entries[], activeEntries: id[], pausedEntries: id[] }`
+- **`runtime.json`:** `{ lastSeenAt }` — heartbeat written every 30 s by the Electron main process
 
 ## Business Rules
 
 - Time rounded up to nearest 15 minutes on completion
-- Multiple timers can run simultaneously; manual pause/resume supported
-- Paused entries form a LIFO stack (interruptions can nest)
+- Multiple timers can run simultaneously; pause/resume is manual (no automatic LIFO stack)
 - Timer survives browser refresh (computed from stored timestamps, not intervals)
+
+### Nothing is ever destroyed
+
+- **Entries are soft-deleted** (`deleted: true`), never removed from the day file. `POST .../restore` brings them back. Filter `!e.deleted` in any new read path (export, stats, UI).
+- **Merge** soft-deletes its originals and recomputes durations server-side from the stored entries. Never trust durations sent by the client.
+- **Activities and customers used by past entries are archived** (`archived: true`), not deleted, so history keeps its labels. `DELETE` returns `{ archived: boolean }` to say what happened. Archived items are hidden from the pickers but still resolve names in the UI, CSV and stats.
+
+### Writing to a day file
+
+Always go through `storage.withTimesheet(date, fn)`. It takes an exclusive lock per file, so read-modify-write is safe (two windows plus the popup write concurrently). Return `false` from `fn` to skip the write. Never do `loadTimesheet` + `saveTimesheet` in a route: that loses concurrent updates.
+
+### A timer must never count time that was not worked
+
+`server/src/routes/system.ts` owns the rules, `electron/main.js` reports what macOS does:
+
+- `powerMonitor` suspend / lock-screen -> `POST /api/system/suspend` closes open segments and marks `autoPausedAt`
+- resume / unlock-screen -> `POST /api/system/resume` restarts only what it paused itself less than 2 min ago; longer absences stay paused
+- quit -> same pause path with `reason: 'quit'` (the quit is deferred until it is written)
+- startup -> `POST /api/system/recover` closes segments orphaned by a crash at `runtime.json`'s `lastSeenAt`, not at now
+- midnight (and after waking) -> `POST /api/system/rollover` closes the day's timer at 23:59:59, completes it, and creates a continuation entry at 00:00:00 on the next day
+
+### Menu bar title
+
+Owned by the tray popup renderer only (it is always alive and always on today). Its window runs with `backgroundThrottling: false` so the 1 s tick keeps running while hidden. `TrackerPage` must not write the tray title: it can be showing any date.

@@ -145,6 +145,7 @@ export default function StatsPage() {
   const [customFrom, setCustomFrom] = useState(todayStr);
   const [customTo, setCustomTo] = useState(todayStr);
   const [stats, setStats] = useState<StatsData | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const range = period === 'custom'
     ? { from: customFrom, to: customTo }
@@ -155,8 +156,13 @@ export default function StatsPage() {
         : { from: startOfMonth(refDate), to: endOfMonth(refDate) };
 
   const refresh = useCallback(async () => {
-    const data = await api.getStats(range.from, range.to);
-    setStats(data);
+    try {
+      const data = await api.getStats(range.from, range.to);
+      setStats(data);
+      setLoadError(null);
+    } catch {
+      setLoadError("Impossible de contacter le serveur local. Vérifiez que l'application est bien lancée.");
+    }
   }, [range.from, range.to]);
 
   useEffect(() => {
@@ -206,12 +212,29 @@ export default function StatsPage() {
 
   const theme = useChartTheme();
 
-  if (!stats) return <div className="text-center text-muted-foreground py-12">Chargement...</div>;
+  if (!stats) {
+    return (
+      <div className="text-center text-muted-foreground py-12">
+        {loadError ? (
+          <div className="space-y-3">
+            <p className="text-sm text-destructive">{loadError}</p>
+            <Button variant="outline" size="sm" onClick={() => refresh()}>Réessayer</Button>
+          </div>
+        ) : 'Chargement...'}
+      </div>
+    );
+  }
 
   const dayData = stats.byDay.map(d => ({ ...d, label: shortDate(d.date), hours: +(d.minutes / 60).toFixed(1) }));
 
   return (
     <div className="space-y-6 animate-in fade-in duration-200">
+      {loadError && (
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2.5">
+          <p className="text-sm text-destructive">{loadError}</p>
+          <Button variant="outline" size="sm" onClick={() => refresh()}>Réessayer</Button>
+        </div>
+      )}
       {/* Period navigation */}
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div className="inline-flex rounded-md border border-border overflow-hidden shrink-0">

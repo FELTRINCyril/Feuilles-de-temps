@@ -23,16 +23,34 @@ export function createActivitiesRouter(storage: Storage) {
     const data = await storage.loadActivities();
     const activity = data.activities.find((a) => a.id === req.params.id);
     if (!activity) return res.status(404).json({ error: 'Not found' });
-    Object.assign(activity, req.body, { id: activity.id });
+    // Only known fields, so a stray payload can't pollute the file.
+    if (typeof req.body.name === 'string') activity.name = req.body.name;
+    if (typeof req.body.customerId === 'string') activity.customerId = req.body.customerId;
+    if (req.body.archived !== undefined) {
+      if (req.body.archived) activity.archived = true;
+      else delete activity.archived;
+    }
     await storage.saveActivities(data);
     res.json(activity);
   });
 
+  // Deleting an activity that past entries point to would leave them unlabelled
+  // for good, so a used activity is archived instead: hidden from the pickers,
+  // still resolving its name in history, exports and stats.
   router.delete('/:id', async (req, res) => {
     const data = await storage.loadActivities();
+    const activity = data.activities.find((a) => a.id === req.params.id);
+    if (!activity) return res.status(204).end();
+
+    if (await storage.isActivityUsed(req.params.id)) {
+      activity.archived = true;
+      await storage.saveActivities(data);
+      return res.json({ archived: true, activity });
+    }
+
     data.activities = data.activities.filter((a) => a.id !== req.params.id);
     await storage.saveActivities(data);
-    res.status(204).end();
+    res.json({ archived: false });
   });
 
   return router;

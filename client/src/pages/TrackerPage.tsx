@@ -11,12 +11,12 @@ import {
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
 } from '@/components/ui/dialog';
-import { ChevronLeft, ChevronRight, Play, Pause, CircleStop, Trash2, RotateCcw, CalendarDays, Clock, Merge, Pencil } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Play, Pause, CircleStop, Trash2, RotateCcw, CalendarDays, Clock, Merge, Pencil, Undo2, MoonStar, Scissors } from 'lucide-react';
+import { onSystemSync } from '../desktop';
+import { ClientActivityPicker } from '../components/ClientActivityPicker';
 
-async function updateTrayTitle(text: string) {
-  const desktop = await import('../desktop');
-  desktop.setTrayTitle(text);
-}
+// The menu bar title is owned by the tray popup alone (see TrayPopupPage): it is
+// always alive and always on today, whereas this page can be showing any date.
 
 // ---------------------------------------------------------------------------
 // Helper functions
@@ -39,17 +39,29 @@ function formatDuration(minutes: number): string {
   return `${h}h${String(m).padStart(2, '0')}`;
 }
 
-function computeElapsedSeconds(entry: TimesheetEntry): number {
+/**
+ * `now` caps an open segment's end. Pass Date.now() when the entry's day is
+ * today (the normal ticking timer); when browsing a past day, pass that day's
+ * 23:59:59 instead, otherwise an entry left open on an old day (a pre-rollover
+ * leftover) would show a chrono counting up from real now, hours or days off.
+ */
+function computeElapsedSeconds(entry: TimesheetEntry, now: number): number {
   let totalSec = 0;
   for (const seg of entry.segments) {
     const startMs = parseTimestamp(seg.start).getTime();
     if (seg.end) {
       totalSec += Math.floor((parseTimestamp(seg.end).getTime() - startMs) / 1000);
     } else {
-      totalSec += Math.max(0, Math.floor((Date.now() - startMs) / 1000));
+      totalSec += Math.max(0, Math.floor((now - startMs) / 1000));
     }
   }
   return totalSec;
+}
+
+/** ms of 23:59:59.999 local time on the given YYYY-MM-DD. */
+function endOfDayMs(dateStr: string): number {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  return new Date(y, m - 1, d, 23, 59, 59, 999).getTime();
 }
 
 function formatTimer(totalSeconds: number): string {
@@ -106,6 +118,23 @@ function parseTimestamp(value: string): Date {
   return d;
 }
 
+function hhmm(iso: string): string {
+  const d = parseTimestamp(iso);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+/** Why this entry stopped on its own, in plain words, or null if the user did it. */
+function autoStopReason(entry: TimesheetEntry): string | null {
+  if (entry.recoveredAt) {
+    return `Clôturée à ${hhmm(entry.recoveredAt)} : l'app s'est arrêtée, le temps d'arrêt n'a pas été compté`;
+  }
+  if (!entry.autoPausedAt) return null;
+  const at = hhmm(entry.autoPausedAt);
+  if (entry.autoPauseReason === 'lock') return `En pause depuis ${at} : session verrouillée`;
+  if (entry.autoPauseReason === 'quit') return `En pause depuis ${at} : application fermée`;
+  return `En pause depuis ${at} : Mac en veille`;
+}
+
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
@@ -136,22 +165,36 @@ export default function TrackerPage() {
   const [mergeActivityId, setMergeActivityId] = useState('');
   const [mergeDescription, setMergeDescription] = useState('');
 
+  // Last soft-deleted entry, so the deletion can be undone right away
+  const [undoDelete, setUndoDelete] = useState<{ id: string; label: string } | null>(null);
+
+  const [loadError, setLoadError] = useState<string | null>(null);
+
   const syncChannel = useRef(new BroadcastChannel('tempo-sync'));
   useEffect(() => () => syncChannel.current.close(), []);
 
   const refresh = useCallback(async (notify = false) => {
-    const [t, a, c] = await Promise.all([
-      api.getTimesheet(currentDate),
-      api.getActivities(),
-      api.getCustomers(),
-    ]);
-    setDay(t);
-    setActivities(a);
-    setCustomers(c);
-    if (notify) syncChannel.current.postMessage('refresh');
+    try {
+      const [t, a, c] = await Promise.all([
+        api.getTimesheet(currentDate),
+        api.getActivities(),
+        api.getCustomers(),
+      ]);
+      setDay(t);
+      setActivities(a);
+      setCustomers(c);
+      setLoadError(null);
+      if (notify) syncChannel.current.postMessage('refresh');
+    } catch {
+      // Keep whatever was last loaded on screen; only the banner tells the
+      // user something is wrong, instead of "Chargement..." forever.
+      setLoadError("Impossible de contacter le serveur local. Vérifiez que l'application est bien lancée.");
+    }
   }, [currentDate]);
 
   useEffect(() => { refresh(); }, [refresh]);
+  // The main process may have paused or split timers (sleep, lock, midnight)
+  useEffect(() => onSystemSync(() => { refresh(); }), [refresh]);
   // Listen for cross-window sync events (from popup/navbar)
   useEffect(() => {
     syncChannel.current.onmessage = () => refresh();
@@ -166,6 +209,15 @@ export default function TrackerPage() {
     window.addEventListener('storage', handler);
     return () => window.removeEventListener('storage', handler);
   }, [currentDate]);
+
+  // Whether archived clients/activities should be offered in the pickers,
+  // set from Settings; kept in sync if changed in another window.
+  const [showArchived, setShowArchived] = useState(() => localStorage.getItem('showArchived') === '1');
+  useEffect(() => {
+    const handler = () => setShowArchived(localStorage.getItem('showArchived') === '1');
+    window.addEventListener('storage', handler);
+    return () => window.removeEventListener('storage', handler);
+  }, []);
 
   function shiftDate(offset: number) {
     const [y, m, d] = currentDate.split('-').map(Number);
@@ -188,32 +240,32 @@ export default function TrackerPage() {
   useEffect(() => {
     if (activeEntries.length === 0) {
       setElapsedMap({});
-      updateTrayTitle(pausedEntries.length > 0 ? '⏸' : '');
       return;
     }
     function tick() {
+      const now = currentDate === todayStr() ? Date.now() : endOfDayMs(currentDate);
       const map: Record<string, number> = {};
       for (const entry of activeEntries) {
-        map[entry.id] = computeElapsedSeconds(entry);
+        map[entry.id] = computeElapsedSeconds(entry, now);
       }
       setElapsedMap(map);
-      if (activeEntries.length === 1) {
-        updateTrayTitle(formatTimer(map[activeEntries[0].id] ?? 0));
-      } else {
-        updateTrayTitle(`${activeEntries.length} actifs`);
-      }
     }
     tick();
     const id = setInterval(tick, 1000);
     return () => clearInterval(id);
-  }, [activeEntries.length, activeEntries.map(e => e.id).join(','), pausedEntries.length]);
+  }, [activeEntries.length, activeEntries.map(e => e.id).join(','), currentDate]);
 
   const completedEntries: TimesheetEntry[] =
-    day?.entries.filter(e => e.status === 'completed') ?? [];
+    day?.entries.filter(e => e.status === 'completed' && !e.deleted) ?? [];
+
+  // Soft-deleted entries stay in the file: they can always be brought back.
+  const deletedEntries: TimesheetEntry[] = day?.entries.filter(e => e.deleted) ?? [];
 
   const completedMinutes = completedEntries.reduce((s, e) => s + e.roundedMinutes, 0);
   const activeMinutes = activeEntries.reduce((sum, e) => sum + Math.round((elapsedMap[e.id] ?? 0) / 60), 0);
-  const pausedMinutes = pausedEntries.reduce((sum, e) => sum + Math.round(computeElapsedSeconds(e) / 60), 0);
+  // A paused entry never has an open segment, so no reference "now" is needed
+  // (and none is read during render, which the lint rules here forbid).
+  const pausedMinutes = pausedEntries.reduce((sum, e) => sum + Math.round(computeElapsedSeconds(e, 0) / 60), 0);
   const totalMinutes = completedMinutes + activeMinutes + pausedMinutes;
   const completedPct = Math.min(100, (completedMinutes / targetMinutes) * 100);
   const activePct = Math.min(100 - completedPct, (activeMinutes / targetMinutes) * 100);
@@ -236,14 +288,6 @@ export default function TrackerPage() {
       activityId: entry.activityId,
     });
     await api.pauseEntry(currentDate, entry.id);
-    const remainingActive = activeEntries.filter(e => e.id !== entry.id);
-    if (remainingActive.length === 0) {
-      updateTrayTitle('⏸');
-    } else if (remainingActive.length === 1) {
-      // Will show single timer on next tick
-    } else {
-      updateTrayTitle(`${remainingActive.length} actifs`);
-    }
     await refresh(true);
   }
 
@@ -254,14 +298,6 @@ export default function TrackerPage() {
       activityId: entry.activityId,
     });
     await api.updateEntry(currentDate, entry.id, { status: 'completed' });
-    const remainingActive = activeEntries.filter(e => e.id !== entry.id);
-    if (remainingActive.length === 0) {
-      updateTrayTitle(pausedEntries.length > 0 ? '⏸' : '');
-    } else if (remainingActive.length === 1) {
-      // Will switch from "N actifs" to single timer on next tick
-    } else {
-      updateTrayTitle(`${remainingActive.length} actifs`);
-    }
     await refresh(true);
   }
 
@@ -314,16 +350,11 @@ export default function TrackerPage() {
     const entries = completedEntries.filter(e => selectedForMerge.has(e.id));
     if (entries.length < 2) return;
 
-    const totalMins = entries.reduce((sum, e) => {
-      return sum + (mergeUseIndicated[e.id] ? e.roundedMinutes : e.totalMinutes);
-    }, 0);
-
     await api.mergeEntries(currentDate, {
       entryIds: entries.map(e => e.id),
       activityId: mergeActivityId,
       description: mergeDescription,
-      totalMinutes: totalMins,
-      roundedMinutes: roundUp15(totalMins),
+      useIndicated: entries.filter(e => mergeUseIndicated[e.id]).map(e => e.id),
     });
 
     setSelectedForMerge(new Set());
@@ -332,12 +363,27 @@ export default function TrackerPage() {
   }
 
   async function handleDeleteEntry(id: string) {
+    const entry = day?.entries.find(e => e.id === id);
     await api.deleteEntry(currentDate, id);
-    const remainingActive = activeEntries.filter(e => e.id !== id);
-    if (remainingActive.length === 0) {
-      const remainingPaused = pausedEntries.filter(e => e.id !== id);
-      updateTrayTitle(remainingPaused.length > 0 ? '⏸' : '');
-    }
+    // Nothing is erased on the server, so offer to put it straight back
+    setUndoDelete({
+      id,
+      label: entry ? entryLabel(entry, activities.activities, customers.customers) : 'Entrée',
+    });
+    await refresh(true);
+  }
+
+  async function handleRestoreEntry(id: string) {
+    await api.restoreEntry(currentDate, id);
+    setUndoDelete(prev => (prev?.id === id ? null : prev));
+    await refresh(true);
+  }
+
+  async function handlePurgeEntry(entry: TimesheetEntry) {
+    const label = entryLabel(entry, activities.activities, customers.customers);
+    if (!confirm(`Supprimer définitivement "${label}" ? Cette action est irréversible.`)) return;
+    await api.purgeEntry(currentDate, entry.id);
+    setUndoDelete(prev => (prev?.id === entry.id ? null : prev));
     await refresh(true);
   }
 
@@ -376,14 +422,33 @@ export default function TrackerPage() {
     setEditingEntry(null);
   }
 
-  const sortedActivities = [...activities.activities]
-    .map(a => ({ ...a, label: activityOptionLabel(a, customers.customers) }))
-    .sort((a, b) => a.label.localeCompare(b.label));
+  useEffect(() => {
+    if (!undoDelete) return;
+    const id = setTimeout(() => setUndoDelete(null), 10000);
+    return () => clearTimeout(id);
+  }, [undoDelete]);
 
-  if (!day) return <div className="text-center text-muted-foreground py-12">Chargement...</div>;
+  if (!day) {
+    return (
+      <div className="text-center text-muted-foreground py-12">
+        {loadError ? (
+          <div className="space-y-3">
+            <p className="text-sm text-destructive">{loadError}</p>
+            <Button variant="outline" size="sm" onClick={() => refresh()}>Réessayer</Button>
+          </div>
+        ) : 'Chargement...'}
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6 animate-in fade-in duration-200">
+      {loadError && (
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2.5">
+          <p className="text-sm text-destructive">{loadError}</p>
+          <Button variant="outline" size="sm" onClick={() => refresh()}>Réessayer</Button>
+        </div>
+      )}
       {/* ===== Day header: date left, daily total right ===== */}
       <div className="flex items-end justify-between gap-4">
         <div className="flex items-center gap-2">
@@ -467,19 +532,17 @@ export default function TrackerPage() {
                     <span className="h-2 w-2 rounded-full bg-tempo animate-tempo-pulse" aria-hidden="true" />
                     En cours
                   </div>
-                  <select
-                    className="w-full h-9 rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs focus-visible:outline-none focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px]"
-                    value={entry.activityId}
-                    onChange={async (e) => {
-                      await api.updateEntry(currentDate, entry.id, { activityId: e.target.value });
+                  <ClientActivityPicker
+                    customers={customers.customers}
+                    activities={activities.activities}
+                    activityId={entry.activityId}
+                    showArchived={showArchived}
+                    onDataChanged={refresh}
+                    onChange={async (activityId) => {
+                      await api.updateEntry(currentDate, entry.id, { activityId });
                       await refresh(true);
                     }}
-                  >
-                    <option value="">-- Activité --</option>
-                    {sortedActivities.map(a => (
-                      <option key={a.id} value={a.id}>{a.label}</option>
-                    ))}
-                  </select>
+                  />
                   <Input
                     placeholder="Description..."
                     value={entry.description}
@@ -543,6 +606,12 @@ export default function TrackerPage() {
                     </p>
                     {entry.description && (
                       <p className="text-xs text-muted-foreground truncate mt-0.5">{entry.description}</p>
+                    )}
+                    {autoStopReason(entry) && (
+                      <p className="flex items-center gap-1 text-xs text-warning mt-0.5 truncate">
+                        <MoonStar className="h-3 w-3 shrink-0" aria-hidden="true" />
+                        {autoStopReason(entry)}
+                      </p>
                     )}
                   </div>
                   <div className="flex gap-1.5 shrink-0">
@@ -622,6 +691,11 @@ export default function TrackerPage() {
                       {activityNameOnly(entry, activities.activities) || '—'}
                     </TableCell>
                     <TableCell className="truncate cursor-pointer" onClick={() => openEditModal(entry)}>
+                      {entry.splitAtMidnight && (
+                        <span title="Coupée à minuit (le timer a changé de jour)">
+                          <Scissors className="inline h-3 w-3 mr-1 text-muted-foreground align-[-1px]" />
+                        </span>
+                      )}
                       {entry.description || <span className="text-muted-foreground/50">—</span>}
                     </TableCell>
                     <TableCell className="font-mono text-xs text-muted-foreground text-right">
@@ -690,6 +764,63 @@ export default function TrackerPage() {
         </section>
       )}
 
+      {/* ===== Deleted entries (nothing is ever erased on disk) ===== */}
+      {deletedEntries.length > 0 && (
+        <section className="space-y-2">
+          <h2 className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+            Supprimées ({deletedEntries.length})
+          </h2>
+          <div className="rounded-lg border border-dashed border-border divide-y divide-border">
+            {deletedEntries.map(entry => (
+              <div key={entry.id} className="flex items-center justify-between gap-3 px-3 py-2">
+                <p className="text-sm text-muted-foreground truncate">
+                  <span className="line-through">
+                    {entryLabel(entry, activities.activities, customers.customers)}
+                    {entry.description ? ` · ${entry.description}` : ''}
+                  </span>
+                  <span className="font-mono text-xs"> · {formatDuration(entry.totalMinutes)}</span>
+                </p>
+                <div className="flex gap-1.5 shrink-0">
+                  <Button variant="outline" size="sm" onClick={() => handleRestoreEntry(entry.id)}>
+                    <Undo2 className="h-3.5 w-3.5" />
+                    Restaurer
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-destructive hover:text-destructive hover:bg-destructive/10"
+                    onClick={() => handlePurgeEntry(entry)}
+                    title="Supprimer définitivement"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {/* ===== Undo toast ===== */}
+      {undoDelete && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 rounded-xl border border-border bg-popover px-4 py-3 shadow-lg animate-in fade-in slide-in-from-bottom-2">
+          <span className="text-sm">
+            Entrée supprimée : <span className="font-medium">{undoDelete.label}</span>
+          </span>
+          <Button size="sm" variant="outline" onClick={() => handleRestoreEntry(undoDelete.id)}>
+            <Undo2 className="h-3.5 w-3.5" />
+            Annuler
+          </Button>
+          <button
+            onClick={() => setUndoDelete(null)}
+            title="Fermer"
+            className="text-muted-foreground hover:text-foreground text-sm"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
       {/* ===== Merge Modal ===== */}
       <Dialog open={mergeOpen} onOpenChange={(open) => { if (!open) setMergeOpen(false); }}>
         <DialogContent className="max-w-md">
@@ -751,16 +882,14 @@ export default function TrackerPage() {
             {/* Activity */}
             <div className="space-y-1.5">
               <label className="text-sm font-medium text-muted-foreground">Activité</label>
-              <select
-                className="w-full h-9 rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs focus-visible:outline-none focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px]"
-                value={mergeActivityId}
-                onChange={e => setMergeActivityId(e.target.value)}
-              >
-                <option value="">-- Activité --</option>
-                {sortedActivities.map(a => (
-                  <option key={a.id} value={a.id}>{a.label}</option>
-                ))}
-              </select>
+              <ClientActivityPicker
+                customers={customers.customers}
+                activities={activities.activities}
+                activityId={mergeActivityId}
+                showArchived={showArchived}
+                onDataChanged={refresh}
+                onChange={setMergeActivityId}
+              />
             </div>
 
             {/* Description */}
@@ -792,16 +921,14 @@ export default function TrackerPage() {
           <div className="space-y-4">
             <div className="space-y-1.5">
               <label className="text-sm font-medium text-muted-foreground">Activité</label>
-              <select
-                className="w-full h-9 rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs focus-visible:outline-none focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px]"
-                value={editActivityId}
-                onChange={e => setEditActivityId(e.target.value)}
-              >
-                <option value="">-- Activité --</option>
-                {sortedActivities.map(a => (
-                  <option key={a.id} value={a.id}>{a.label}</option>
-                ))}
-              </select>
+              <ClientActivityPicker
+                customers={customers.customers}
+                activities={activities.activities}
+                activityId={editActivityId}
+                showArchived={showArchived}
+                onDataChanged={refresh}
+                onChange={setEditActivityId}
+              />
             </div>
             <div className="space-y-1.5">
               <label className="text-sm font-medium text-muted-foreground">Description</label>

@@ -1,7 +1,8 @@
-import { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, screen, dialog, shell } from 'electron';
+import { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, screen, dialog, shell, powerMonitor } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import https from 'node:https';
+import http from 'node:http';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -113,6 +114,102 @@ async function startServer() {
   console.log(`Server running on http://127.0.0.1:${PORT} (data: ${dataDir})`);
 }
 
+// ── Timer maintenance (sleep, lock, midnight, crash recovery) ───────────────
+// A running timer must never count time that was not worked. The server owns the
+// rules (see server/src/routes/system.ts); the main process just tells it what
+// macOS is doing.
+
+const HEARTBEAT_MS = 30 * 1000;
+
+let heartbeatTimer = null;
+let midnightTimer = null;
+
+function callApi(apiPath, body = {}) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body);
+    const req = http.request({
+      hostname: '127.0.0.1',
+      port: PORT,
+      path: apiPath,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+      timeout: 10000,
+    }, (res) => {
+      let raw = '';
+      res.on('data', (c) => { raw += c; });
+      res.on('end', () => {
+        if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
+        try { resolve(JSON.parse(raw)); } catch (e) { reject(e); }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.end(payload);
+  });
+}
+
+// Tell every window to reload its data after we changed timers behind its back.
+function broadcastSync() {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) win.webContents.send('system-sync');
+  }
+}
+
+async function maintenance(apiPath, body, describe) {
+  try {
+    const result = await callApi(apiPath, body);
+    if (describe) console.log(`[timers] ${describe(result)}`);
+    broadcastSync();
+    return result;
+  } catch (e) {
+    console.warn(`[timers] ${apiPath} failed: ${e && e.message ? e.message : String(e)}`);
+    return null;
+  }
+}
+
+const pauseTimers = (reason) =>
+  maintenance('/api/system/suspend', { reason }, (r) => `${reason}: ${r.paused} timer(s) paused`);
+
+const resumeTimers = () =>
+  maintenance('/api/system/resume', {}, (r) => `resume: ${r.resumed} resumed, ${r.stillPaused} left paused`);
+
+const rolloverTimers = () =>
+  maintenance('/api/system/rollover', {}, (r) => `midnight: ${r.splits.length} day(s) split`);
+
+function startHeartbeat() {
+  clearInterval(heartbeatTimer);
+  // Records "the app was alive at T" so a crash can be recovered without
+  // counting the downtime as worked time.
+  heartbeatTimer = setInterval(() => {
+    callApi('/api/system/heartbeat').catch(() => {});
+  }, HEARTBEAT_MS);
+  callApi('/api/system/heartbeat').catch(() => {});
+}
+
+// Fire a few seconds after the next midnight, then every night.
+function scheduleMidnight() {
+  clearTimeout(midnightTimer);
+  const now = new Date();
+  const next = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 10, 0);
+  midnightTimer = setTimeout(async () => {
+    await rolloverTimers();
+    scheduleMidnight();
+  }, Math.max(1000, next.getTime() - now.getTime()));
+}
+
+function watchPowerEvents() {
+  powerMonitor.on('suspend', () => pauseTimers('suspend'));
+  powerMonitor.on('lock-screen', () => pauseTimers('lock'));
+  powerMonitor.on('resume', async () => {
+    await resumeTimers();
+    // Waking up may also mean a day boundary was crossed while asleep, and the
+    // midnight timeout never fired.
+    await rolloverTimers();
+    scheduleMidnight();
+  });
+  powerMonitor.on('unlock-screen', () => resumeTimers());
+}
+
 // ── Windows ─────────────────────────────────────────────────────────────────
 
 // Renderer windows may only display the local frontend
@@ -165,6 +262,9 @@ function createPopupWindow() {
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
+      // This hidden window drives the clock shown in the menu bar. Chromium would
+      // otherwise throttle its 1 s tick down to once a minute once it is hidden.
+      backgroundThrottling: false,
     },
   });
   // Visible on all spaces, above the menu bar, without stealing focus disruptively
@@ -386,6 +486,15 @@ app.whenReady().then(async () => {
     return;
   }
 
+  // Before anything is displayed: close segments left open by a crash or a
+  // forced quit (at the last heartbeat, not at now), then split any timer that
+  // crossed midnight while the app was down.
+  await maintenance('/api/system/recover', {}, (r) => `recover: ${r.recovered} orphan segment(s) closed`);
+  await rolloverTimers();
+  startHeartbeat();
+  scheduleMidnight();
+  watchPowerEvents();
+
   createMainWindow();
   createPopupWindow();
   await createTray();
@@ -412,6 +521,18 @@ app.whenReady().then(async () => {
 // Tray app: keep running when all windows are closed
 app.on('window-all-closed', () => {});
 
-app.on('before-quit', () => {
+// Quitting stops the clock: a timer must not keep counting while the app is
+// closed. The quit is deferred until the pause has actually been written.
+let quitCleanupDone = false;
+
+app.on('before-quit', (event) => {
   app.isQuittingForReal = true;
+  if (quitCleanupDone) return;
+  event.preventDefault();
+  clearInterval(heartbeatTimer);
+  clearTimeout(midnightTimer);
+  pauseTimers('quit').finally(() => {
+    quitCleanupDone = true;
+    app.quit();
+  });
 });

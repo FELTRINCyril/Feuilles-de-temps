@@ -10,4 +10,10 @@ contextBridge.exposeInMainWorld('desktopAPI', {
   openExternal: (url) => ipcRenderer.send('open-external', url),
   onUpdaterEvent: (callback) =>
     ipcRenderer.on('updater-event', (_event, type, data) => callback(type, data)),
+  // Main process changed timers behind our back (sleep, lock, midnight, recovery)
+  onSystemSync: (callback) => {
+    const handler = () => callback();
+    ipcRenderer.on('system-sync', handler);
+    return () => ipcRenderer.removeListener('system-sync', handler);
+  },
 });

@@ -3,6 +3,7 @@ import type { TimesheetDay, TimesheetEntry, ActivitiesData, CustomersData } from
 import * as api from '../api';
 import * as desktop from '../desktop';
 import { Play, Pause, CircleStop, Trash2, Plus, X, Clock, ChevronLeft, Maximize2 } from 'lucide-react';
+import { ClientActivityPicker } from '../components/ClientActivityPicker';
 
 async function updateTrayTitle(text: string) {
   desktop.setTrayTitle(text);
@@ -79,7 +80,25 @@ export default function TrayPopupPage() {
   const [customers, setCustomers] = useState<CustomersData>({ customers: [] });
   const [elapsedMap, setElapsedMap] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(false);
-  const [currentDate] = useState(todayStr);
+  // The app runs for days on end: this must follow the calendar, otherwise the
+  // popup keeps reading and writing yesterday's file.
+  const [currentDate, setCurrentDate] = useState(todayStr);
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      const today = todayStr();
+      setCurrentDate(prev => (prev === today ? prev : today));
+    }, 30_000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Whether archived clients/activities should be offered in the picker
+  const [showArchived, setShowArchived] = useState(() => localStorage.getItem('showArchived') === '1');
+  useEffect(() => {
+    const handler = () => setShowArchived(localStorage.getItem('showArchived') === '1');
+    window.addEventListener('storage', handler);
+    return () => window.removeEventListener('storage', handler);
+  }, []);
 
   // Edit panel state
   const [editingEntry, setEditingEntry] = useState<TimesheetEntry | null>(null);
@@ -114,9 +133,19 @@ export default function TrayPopupPage() {
   useEffect(() => {
     syncChannel.current.onmessage = () => refresh();
   }, [refresh]);
+  useEffect(() => desktop.onSystemSync(() => { refresh(); }), [refresh]);
   useEffect(() => {
-    const id = setInterval(refresh, 2000);
-    return () => clearInterval(id);
+    // Only poll while the popup is actually on screen: hidden, it would keep
+    // waking the machine up for nothing.
+    let id: ReturnType<typeof setInterval> | null = null;
+    const start = () => { if (id === null) id = setInterval(refresh, 2000); };
+    const stop = () => { if (id !== null) { clearInterval(id); id = null; } };
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') { refresh(); start(); } else { stop(); }
+    };
+    onVisibility();
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => { stop(); document.removeEventListener('visibilitychange', onVisibility); };
   }, [refresh]);
 
   const activeEntries: TimesheetEntry[] =
@@ -223,10 +252,6 @@ export default function TrayPopupPage() {
     setEditingEntry(null);
   }
 
-  const sortedActivities = [...activities.activities]
-    .map(a => ({ ...a, label: activityOptionLabel(a, customers.customers) }))
-    .sort((a, b) => a.label.localeCompare(b.label));
-
   // ── Edit panel view ──────────────────────────────────────────────────────
   if (editingEntry) {
     // Keep entry fresh from day data
@@ -259,19 +284,18 @@ export default function TrayPopupPage() {
             </div>
           )}
 
-          {/* Activity select */}
+          {/* Client + activity */}
           <div className="space-y-1">
-            <label className="text-xs text-muted-foreground">Activité</label>
-            <select
-              value={editActivityId}
-              onChange={e => setEditActivityId(e.target.value)}
-              className="w-full rounded-lg border border-border bg-card px-2.5 py-2 text-sm"
-            >
-              <option value="">-- Aucune --</option>
-              {sortedActivities.map(a => (
-                <option key={a.id} value={a.id}>{a.label}</option>
-              ))}
-            </select>
+            <label className="text-xs text-muted-foreground">Client / Activité</label>
+            <ClientActivityPicker
+              customers={customers.customers}
+              activities={activities.activities}
+              activityId={editActivityId}
+              showArchived={showArchived}
+              onDataChanged={refresh}
+              onChange={setEditActivityId}
+              className="grid grid-cols-1 gap-1.5"
+            />
           </div>
 
           {/* Description */}

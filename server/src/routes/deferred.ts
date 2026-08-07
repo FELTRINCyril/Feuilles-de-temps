@@ -11,7 +11,7 @@ export function createDeferredRouter(storage: Storage) {
     for (const date of dates) {
       const day = await storage.loadTimesheet(date);
       for (const entry of day.entries) {
-        if (entry.deferred) {
+        if (entry.deferred && !entry.deleted) {
           results.push({ date, entry });
         }
       }

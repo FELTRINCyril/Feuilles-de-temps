@@ -132,7 +132,7 @@ describe('Timesheet API', () => {
     expect(res.body.activeEntries).toHaveLength(0);
   });
 
-  it('DELETE removes entry', async () => {
+  it('DELETE soft-deletes the entry and stops its timer', async () => {
     const create = await request(app)
       .post(`/api/timesheet/${DATE}/entries`)
       .send({ activityId: 'p1',  description: 'W' });
@@ -140,8 +140,157 @@ describe('Timesheet API', () => {
     const res = await request(app)
       .delete(`/api/timesheet/${DATE}/entries/${entryId}`);
     expect(res.status).toBe(200);
-    expect(res.body.entries).toHaveLength(0);
+    // Kept in the file so it can be restored, but out of the running lists
+    const entry = res.body.entries.find((e: any) => e.id === entryId);
+    expect(entry.deleted).toBe(true);
+    expect(entry.segments.every((s: any) => s.end !== null)).toBe(true);
     expect(res.body.activeEntries).toHaveLength(0);
+    expect(res.body.pausedEntries).toHaveLength(0);
+  });
+
+  it('POST /restore brings a deleted entry back, paused', async () => {
+    const create = await request(app)
+      .post(`/api/timesheet/${DATE}/entries`)
+      .send({ activityId: 'p1', description: 'W' });
+    const entryId = create.body.activeEntries[0];
+    await request(app).delete(`/api/timesheet/${DATE}/entries/${entryId}`);
+
+    const res = await request(app).post(`/api/timesheet/${DATE}/entries/${entryId}/restore`);
+    expect(res.status).toBe(200);
+    const entry = res.body.entries.find((e: any) => e.id === entryId);
+    expect(entry.deleted).toBeUndefined();
+    expect(entry.status).toBe('paused');
+    expect(res.body.pausedEntries).toContain(entryId);
+    // No time invented while it was deleted
+    expect(entry.segments.every((s: any) => s.end !== null)).toBe(true);
+  });
+
+  it('restoring a deleted completed entry keeps it completed', async () => {
+    const create = await request(app)
+      .post(`/api/timesheet/${DATE}/entries`)
+      .send({ activityId: 'p1', description: 'W' });
+    const entryId = create.body.activeEntries[0];
+    await request(app)
+      .patch(`/api/timesheet/${DATE}/entries/${entryId}`)
+      .send({ status: 'completed' });
+    await request(app).delete(`/api/timesheet/${DATE}/entries/${entryId}`);
+
+    const res = await request(app).post(`/api/timesheet/${DATE}/entries/${entryId}/restore`);
+    const entry = res.body.entries.find((e: any) => e.id === entryId);
+    expect(entry.status).toBe('completed');
+    expect(res.body.pausedEntries).not.toContain(entryId);
+  });
+
+  it('DELETE /purge refuses to remove an entry that is not in the trash', async () => {
+    const create = await request(app)
+      .post(`/api/timesheet/${DATE}/entries`)
+      .send({ activityId: 'p1', description: 'W' });
+    const entryId = create.body.activeEntries[0];
+
+    const res = await request(app).delete(`/api/timesheet/${DATE}/entries/${entryId}/purge`);
+    expect(res.status).toBe(400);
+    const day = await request(app).get(`/api/timesheet/${DATE}`);
+    expect(day.body.entries.find((e: any) => e.id === entryId)).toBeDefined();
+  });
+
+  it('DELETE /purge permanently removes a soft-deleted entry', async () => {
+    const create = await request(app)
+      .post(`/api/timesheet/${DATE}/entries`)
+      .send({ activityId: 'p1', description: 'W' });
+    const entryId = create.body.activeEntries[0];
+    await request(app).delete(`/api/timesheet/${DATE}/entries/${entryId}`);
+
+    const res = await request(app).delete(`/api/timesheet/${DATE}/entries/${entryId}/purge`);
+    expect(res.status).toBe(200);
+    expect(res.body.entries.find((e: any) => e.id === entryId)).toBeUndefined();
+
+    // Gone for good: restore can no longer bring it back
+    const restore = await request(app).post(`/api/timesheet/${DATE}/entries/${entryId}/restore`);
+    expect(restore.status).toBe(404);
+  });
+
+  it('concurrent PATCHes on the same day do not lose each other', async () => {
+    const a = await request(app)
+      .post(`/api/timesheet/${DATE}/entries`)
+      .send({ activityId: 'p1', description: '' });
+    const idA = a.body.activeEntries[0];
+    const b = await request(app)
+      .post(`/api/timesheet/${DATE}/entries`)
+      .send({ activityId: 'p2', description: '' });
+    const idB = b.body.activeEntries.find((id: string) => id !== idA);
+
+    // Both windows editing at the same time: neither write may be dropped
+    await Promise.all([
+      request(app).patch(`/api/timesheet/${DATE}/entries/${idA}`).send({ description: 'from window A' }),
+      request(app).patch(`/api/timesheet/${DATE}/entries/${idB}`).send({ description: 'from popup B' }),
+    ]);
+
+    const res = await request(app).get(`/api/timesheet/${DATE}`);
+    expect(res.body.entries.find((e: any) => e.id === idA).description).toBe('from window A');
+    expect(res.body.entries.find((e: any) => e.id === idB).description).toBe('from popup B');
+  });
+
+  it('PATCH on a missing entry returns 404 and writes nothing', async () => {
+    const res = await request(app)
+      .patch(`/api/timesheet/${DATE}/entries/does-not-exist`)
+      .send({ description: 'x' });
+    expect(res.status).toBe(404);
+  });
+
+  it('merge keeps the real time span, sums stored durations and is undoable', async () => {
+    const a = await request(app)
+      .post(`/api/timesheet/${DATE}/entries`)
+      .send({ activityId: 'p1', description: 'A' });
+    const idA = a.body.activeEntries[0];
+    await request(app).post(`/api/timesheet/${DATE}/entries/${idA}/pause`);
+    await request(app).patch(`/api/timesheet/${DATE}/entries/${idA}`).send({ totalMinutes: 20 });
+    await request(app).patch(`/api/timesheet/${DATE}/entries/${idA}`).send({ status: 'completed' });
+
+    const b = await request(app)
+      .post(`/api/timesheet/${DATE}/entries`)
+      .send({ activityId: 'p1', description: 'B' });
+    const idB = b.body.activeEntries[0];
+    await request(app).post(`/api/timesheet/${DATE}/entries/${idB}/pause`);
+    await request(app).patch(`/api/timesheet/${DATE}/entries/${idB}`).send({ totalMinutes: 10 });
+    await request(app).patch(`/api/timesheet/${DATE}/entries/${idB}`).send({ status: 'completed' });
+
+    const res = await request(app)
+      .post(`/api/timesheet/${DATE}/entries/merge`)
+      .send({ entryIds: [idA, idB], activityId: 'p1', description: 'A / B' });
+    expect(res.status).toBe(201);
+
+    const merged = res.body.entries.find((e: any) => e.description === 'A / B');
+    // 20 + 10 recomputed server-side, rounded up to 30
+    expect(merged.totalMinutes).toBe(30);
+    expect(merged.roundedMinutes).toBe(30);
+    // Real span kept, not the merge timestamp
+    const starts = [idA, idB].map(id => res.body.entries.find((e: any) => e.id === id).segments[0].start).sort();
+    expect(merged.segments[0].start).toBe(starts[0]);
+    expect(merged.segments[0].end).not.toBe(merged.segments[0].start);
+    // Originals are soft-deleted, so the merge can be undone
+    for (const id of [idA, idB]) {
+      expect(res.body.entries.find((e: any) => e.id === id).deleted).toBe(true);
+    }
+  });
+
+  it('merge refuses unknown entries', async () => {
+    const res = await request(app)
+      .post(`/api/timesheet/${DATE}/entries/merge`)
+      .send({ entryIds: ['nope-1', 'nope-2'], activityId: '', description: '' });
+    expect(res.status).toBe(404);
+  });
+
+  it('PATCH ignores garbage values instead of storing them', async () => {
+    const create = await request(app)
+      .post(`/api/timesheet/${DATE}/entries`)
+      .send({ activityId: 'p1', description: 'W' });
+    const entryId = create.body.activeEntries[0];
+    const res = await request(app)
+      .patch(`/api/timesheet/${DATE}/entries/${entryId}`)
+      .send({ roundedMinutes: 'beaucoup', description: { evil: true } });
+    const entry = res.body.entries.find((e: any) => e.id === entryId);
+    expect(entry.roundedMinutes).toBe(0);
+    expect(entry.description).toBe('W');
   });
 
   it('PATCH totalMinutes edits a paused entry and survives resume+finish', async () => {

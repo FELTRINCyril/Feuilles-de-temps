@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { roundUp15, calcSegmentMinutes, calcTotalMinutes, nowTimestamp, toHHmm } from '../time-utils.js';
+import { roundUp15, calcSegmentMs, calcTotalMinutes, nowTimestamp, toHHmm } from '../time-utils.js';
 
 describe('roundUp15', () => {
   it('rounds 0 to 0', () => expect(roundUp15(0)).toBe(0));
@@ -11,15 +11,15 @@ describe('roundUp15', () => {
   it('rounds 61 to 75', () => expect(roundUp15(61)).toBe(75));
 });
 
-describe('calcSegmentMinutes', () => {
-  it('calculates minutes between two ISO timestamps', () => {
-    expect(calcSegmentMinutes({
+describe('calcSegmentMs', () => {
+  it('calculates milliseconds between two ISO timestamps', () => {
+    expect(calcSegmentMs({
       start: '2026-02-20T08:00:00.000Z',
       end: '2026-02-20T10:15:00.000Z',
-    })).toBe(135);
+    })).toBe(135 * 60000);
   });
   it('returns 0 for null end', () => {
-    expect(calcSegmentMinutes({ start: '2026-02-20T08:00:00.000Z', end: null })).toBe(0);
+    expect(calcSegmentMs({ start: '2026-02-20T08:00:00.000Z', end: null })).toBe(0);
   });
 });
 
@@ -30,6 +30,27 @@ describe('calcTotalMinutes', () => {
       { start: '2026-02-20T11:00:00.000Z', end: '2026-02-20T12:00:00.000Z' },
     ];
     expect(calcTotalMinutes(segments)).toBe(180);
+  });
+
+  it('rounds the summed duration once instead of per segment', () => {
+    // Three 9m50s segments: rounding each one down first gives 9+9+9=27,
+    // losing the 2m30s that the sum actually contains (29m30s -> 29).
+    const segments = [
+      { start: '2026-02-20T08:00:00.000Z', end: '2026-02-20T08:09:50.000Z' },
+      { start: '2026-02-20T09:00:00.000Z', end: '2026-02-20T09:09:50.000Z' },
+      { start: '2026-02-20T10:00:00.000Z', end: '2026-02-20T10:09:50.000Z' },
+    ];
+    expect(calcTotalMinutes(segments)).toBe(29);
+  });
+
+  it('never reports 0 for a segment that lasted a few seconds', () => {
+    const segments = [{ start: '2026-02-20T08:00:00.000Z', end: '2026-02-20T08:00:03.000Z' }];
+    expect(calcTotalMinutes(segments)).toBe(1);
+  });
+
+  it('ignores a still-open segment', () => {
+    const segments = [{ start: '2026-02-20T08:00:00.000Z', end: null }];
+    expect(calcTotalMinutes(segments)).toBe(0);
   });
 });
 

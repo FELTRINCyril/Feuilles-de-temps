@@ -1,16 +1,6 @@
 import { Router } from 'express';
 import type { Storage } from '../storage.js';
-import type { Segment } from '../types.js';
-import { roundUp15 } from '../time-utils.js';
-
-function liveMinutes(segments: Segment[]): number {
-  const now = Date.now();
-  return segments.reduce((sum, seg) => {
-    const start = new Date(seg.start).getTime();
-    const end = seg.end ? new Date(seg.end).getTime() : now;
-    return sum + Math.floor((end - start) / 60000);
-  }, 0);
-}
+import { roundUp15, calcLiveTotalMinutes } from '../time-utils.js';
 
 export function createStatsRouter(storage: Storage) {
   const router = Router();
@@ -21,6 +11,9 @@ export function createStatsRouter(storage: Storage) {
 
     const activities = await storage.loadActivities();
     const customers = await storage.loadCustomers();
+    // One reference instant for the whole request, so two active entries don't
+    // land a minute apart from each other purely from request timing.
+    const now = Date.now();
 
     const byDay: { date: string; minutes: number }[] = [];
     const customerAgg: Record<string, number> = {};
@@ -37,11 +30,11 @@ export function createStatsRouter(storage: Storage) {
       let dayMinutes = 0;
 
       for (const entry of day.entries) {
-        const minutes = entry.status === 'completed'
-          ? entry.roundedMinutes
-          : roundUp15(liveMinutes(entry.segments));
+        if (entry.deleted) continue;
+        const live = calcLiveTotalMinutes(entry.segments, now);
+        const minutes = entry.status === 'completed' ? entry.roundedMinutes : roundUp15(live);
         entryCount++;
-        totalMinutes += entry.status === 'completed' ? entry.totalMinutes : liveMinutes(entry.segments);
+        totalMinutes += entry.status === 'completed' ? entry.totalMinutes : live;
         totalRounded += minutes;
         dayMinutes += minutes;
 

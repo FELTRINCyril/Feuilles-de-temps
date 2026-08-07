@@ -24,6 +24,7 @@ interface DesktopAPI {
   updaterCheck: () => Promise<UpdateCheckResult>;
   openExternal: (url: string) => void;
   onUpdaterEvent: (callback: (type: string, data: UpdateInfo) => void) => void;
+  onSystemSync?: (callback: () => void) => () => void;
 }
 
 declare global {
@@ -56,6 +57,14 @@ export function getAppVersion(): Promise<string | undefined> {
 
 export function checkForUpdates(): Promise<UpdateCheckResult | undefined> {
   return Promise.resolve(window.desktopAPI?.updaterCheck());
+}
+
+/**
+ * The main process rewrote timers (Mac asleep, session locked, midnight crossed,
+ * crash recovered): reload. Returns an unsubscribe function.
+ */
+export function onSystemSync(callback: () => void): () => void {
+  return window.desktopAPI?.onSystemSync?.(callback) ?? (() => {});
 }
 
 export function onUpdaterEvent(
