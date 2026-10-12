@@ -34,6 +34,12 @@ export type EntryStatus = 'active' | 'paused' | 'completed';
 
 export interface TimesheetEntry {
   id: string;
+  /** The entry's client. Stored on the entry itself rather than derived from
+   * the activity, so an entry can carry a client with no activity yet, and so
+   * re-pointing an activity at another client never rewrites past history.
+   * Absent on entries written before this field existed: read it through
+   * resolveCustomerId(), which falls back to the activity's client. */
+  customerId?: string;
   activityId: string;
   description: string;
   segments: Segment[];
@@ -56,6 +62,20 @@ export interface TimesheetEntry {
    * midnight, and on the continuation entry created on the next day. */
   splitAtMidnight?: boolean;
   continuedFrom?: string;
+}
+
+/**
+ * The client an entry belongs to. Entries written before `customerId` existed
+ * only recorded the activity, so their client is still derived from it; every
+ * read path (UI, CSV, stats) must go through here rather than looking the
+ * activity up itself.
+ */
+export function resolveCustomerId(
+  entry: Pick<TimesheetEntry, 'customerId' | 'activityId'>,
+  activities: Pick<Activity, 'id' | 'customerId'>[],
+): string {
+  if (typeof entry.customerId === 'string') return entry.customerId;
+  return activities.find((a) => a.id === entry.activityId)?.customerId ?? '';
 }
 
 export interface TimesheetDay {

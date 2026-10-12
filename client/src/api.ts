@@ -17,7 +17,7 @@ async function json<T>(url: string, init?: RequestInit): Promise<T> {
 export const getTimesheet = (date: string) =>
   json<TimesheetDay>(`/timesheet/${date}`);
 
-export const createEntry = (date: string, body: { activityId: string; description: string }) =>
+export const createEntry = (date: string, body: { customerId?: string; activityId: string; description: string }) =>
   json<TimesheetDay>(`/timesheet/${date}/entries`, { method: 'POST', body: JSON.stringify(body) });
 
 export const updateEntry = (date: string, id: string, body: Record<string, unknown>) =>
@@ -96,6 +96,7 @@ export const getStats = (from: string, to: string) =>
 // useIndicated lists the entries whose rounded ("indiqué") value should be used.
 export const mergeEntries = (date: string, body: {
   entryIds: string[];
+  customerId: string;
   activityId: string;
   description: string;
   useIndicated: string[];

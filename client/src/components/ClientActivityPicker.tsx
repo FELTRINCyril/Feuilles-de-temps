@@ -1,13 +1,20 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useMemo } from 'react';
 import { Combobox } from '@/components/ui/combobox';
 import * as api from '../api';
 import type { Activity, Customer } from '../types';
 
+export interface ClientActivitySelection {
+  customerId: string;
+  activityId: string;
+}
+
 interface Props {
   customers: Customer[];
   activities: Activity[];
-  activityId: string;
-  onChange: (activityId: string) => void;
+  value: ClientActivitySelection;
+  /** Always receives both halves: the client stands on its own, so picking one
+   * without an activity is a complete, saveable choice. */
+  onChange: (next: ClientActivitySelection) => void;
   /** Re-fetches the parent's customer/activity lists after a create, so they
    * stay in sync. The picker itself doesn't wait for that round-trip: it
    * already has the new id from the create response. */
@@ -23,17 +30,9 @@ interface Props {
  * activity is always linked to whichever client is currently selected here.
  */
 export function ClientActivityPicker({
-  customers, activities, activityId, onChange, onDataChanged, showArchived = false, className,
+  customers, activities, value, onChange, onDataChanged, showArchived = false, className,
 }: Props) {
-  const currentActivity = activities.find(a => a.id === activityId);
-  const [customerId, setCustomerId] = useState(currentActivity?.customerId ?? '');
-
-  // Switching to a different entry (a different activityId from outside) resets
-  // which client is shown, since this component's local customerId otherwise
-  // wouldn't know about it.
-  useEffect(() => {
-    setCustomerId(activities.find(a => a.id === activityId)?.customerId ?? '');
-  }, [activityId, activities]);
+  const { customerId, activityId } = value;
 
   const customerOptions = useMemo(() => (
     customers
@@ -61,6 +60,17 @@ export function ClientActivityPicker({
     return created.id;
   }
 
+  function selectCustomer(id: string) {
+    // An activity that belonged to the previous client no longer applies.
+    const keepsActivity = activities.some(a => a.id === activityId && a.customerId === id);
+    onChange({ customerId: id, activityId: keepsActivity ? activityId : '' });
+  }
+
+  function selectActivity(id: string) {
+    const activity = activities.find(a => a.id === id);
+    onChange({ customerId: activity?.customerId || customerId, activityId: id });
+  }
+
   return (
     <div className={className ?? 'grid grid-cols-2 gap-2'}>
       <Combobox
@@ -69,11 +79,7 @@ export function ClientActivityPicker({
         placeholder="-- Client --"
         emptyLabel="-- Aucun client --"
         createLabel={(name) => `Créer le client « ${name} »`}
-        onSelect={(id) => {
-          setCustomerId(id);
-          // An activity that belonged to the previous client no longer applies.
-          if (currentActivity && currentActivity.customerId !== id) onChange('');
-        }}
+        onSelect={selectCustomer}
         onCreate={createCustomer}
       />
       <Combobox
@@ -84,7 +90,7 @@ export function ClientActivityPicker({
         createLabel={(name) => (
           customerId ? `Créer l'activité « ${name} »` : `Créer l'activité « ${name} » (sans client)`
         )}
-        onSelect={onChange}
+        onSelect={selectActivity}
         onCreate={createActivity}
       />
     </div>

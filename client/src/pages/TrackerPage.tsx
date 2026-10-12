@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import type { TimesheetDay, TimesheetEntry, ActivitiesData, CustomersData } from '../types';
+import { resolveCustomerId } from '../types';
 import * as api from '../api';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -14,6 +15,7 @@ import {
 import { ChevronLeft, ChevronRight, Play, Pause, CircleStop, Trash2, RotateCcw, CalendarDays, Clock, Merge, Pencil, Undo2, MoonStar, Scissors } from 'lucide-react';
 import { onSystemSync } from '../desktop';
 import { ClientActivityPicker } from '../components/ClientActivityPicker';
+import type { ClientActivitySelection } from '../components/ClientActivityPicker';
 
 // The menu bar title is owned by the tray popup alone (see TrayPopupPage): it is
 // always alive and always on today, whereas this page can be showing any date.
@@ -71,9 +73,13 @@ function formatTimer(totalSeconds: number): string {
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
 
+/** "Client - Activité", or whichever of the two is set: an entry can now carry
+ * a client on its own. Falls back to the start time when neither is. */
 function entryLabel(entry: TimesheetEntry, activities: { id: string; name: string; customerId: string }[], customersList: { id: string; name: string }[]): string {
-  const activity = activities.find(a => a.id === entry.activityId);
-  if (activity) return activityOptionLabel(activity, customersList);
+  const customerName = resolveCustomerName(entry, activities, customersList);
+  const activityName = activityNameOnly(entry, activities);
+  if (customerName && activityName) return `${customerName} - ${activityName}`;
+  if (customerName || activityName) return customerName || activityName;
   const startTime = entry.segments[0]?.start;
   if (startTime) {
     const d = parseTimestamp(startTime);
@@ -82,20 +88,13 @@ function entryLabel(entry: TimesheetEntry, activities: { id: string; name: strin
   return 'Timer';
 }
 
-function activityOptionLabel(activity: { name: string; customerId: string }, customersList: { id: string; name: string }[]): string {
-  const customer = customersList.find(c => c.id === activity.customerId);
-  return customer ? `${customer.name} - ${activity.name}` : activity.name;
-}
-
 // Activity name only, for table rows where the customer has its own column
 function activityNameOnly(entry: TimesheetEntry, activitiesList: { id: string; name: string }[]): string {
   return activitiesList.find(a => a.id === entry.activityId)?.name ?? '';
 }
 
-function resolveCustomerName(activityId: string, activitiesList: { id: string; customerId: string }[], customersList: { id: string; name: string }[]): string {
-  const activity = activitiesList.find(a => a.id === activityId);
-  if (!activity) return '';
-  return customersList.find(c => c.id === activity.customerId)?.name ?? '';
+function resolveCustomerName(entry: TimesheetEntry, activitiesList: { id: string; customerId: string }[], customersList: { id: string; name: string }[]): string {
+  return customersList.find(c => c.id === resolveCustomerId(entry, activitiesList))?.name ?? '';
 }
 
 function todayStr(): string {
@@ -146,7 +145,7 @@ export default function TrackerPage() {
   const [customers, setCustomers] = useState<CustomersData>({ customers: [] });
   const [elapsedMap, setElapsedMap] = useState<Record<string, number>>({});
   const [editingEntry, setEditingEntry] = useState<TimesheetEntry | null>(null);
-  const [editActivityId, setEditActivityId] = useState('');
+  const [editPick, setEditPick] = useState<ClientActivitySelection>({ customerId: '', activityId: '' });
   const [editDescription, setEditDescription] = useState('');
   const [editMinutes, setEditMinutes] = useState('');
 
@@ -162,7 +161,7 @@ export default function TrackerPage() {
   const [selectedForMerge, setSelectedForMerge] = useState<Set<string>>(new Set());
   const [mergeOpen, setMergeOpen] = useState(false);
   const [mergeUseIndicated, setMergeUseIndicated] = useState<Record<string, boolean>>({});
-  const [mergeActivityId, setMergeActivityId] = useState('');
+  const [mergePick, setMergePick] = useState<ClientActivitySelection>({ customerId: '', activityId: '' });
   const [mergeDescription, setMergeDescription] = useState('');
 
   // Last soft-deleted entry, so the deletion can be undone right away
@@ -283,20 +282,16 @@ export default function TrackerPage() {
 
   async function handlePause(entry: TimesheetEntry) {
     if (!day) return;
-    await api.updateEntry(currentDate, entry.id, {
-      description: entry.description,
-      activityId: entry.activityId,
-    });
+    // Flush the description: the input only saves on blur, and clicking a
+    // button doesn't always blur it first. The picker saves on its own.
+    await api.updateEntry(currentDate, entry.id, { description: entry.description });
     await api.pauseEntry(currentDate, entry.id);
     await refresh(true);
   }
 
   async function handleFinish(entry: TimesheetEntry) {
     if (!day) return;
-    await api.updateEntry(currentDate, entry.id, {
-      description: entry.description,
-      activityId: entry.activityId,
-    });
+    await api.updateEntry(currentDate, entry.id, { description: entry.description });
     await api.updateEntry(currentDate, entry.id, { status: 'completed' });
     await refresh(true);
   }
@@ -313,6 +308,7 @@ export default function TrackerPage() {
 
   async function handleDuplicate(entry: TimesheetEntry) {
     await api.createEntry(currentDate, {
+      customerId: resolveCustomerId(entry, activities.activities),
       activityId: entry.activityId,
       description: entry.description,
     });
@@ -341,7 +337,10 @@ export default function TrackerPage() {
       useIndicated[e.id] = isManualDuration(e);
     }
     setMergeUseIndicated(useIndicated);
-    setMergeActivityId(entries[0].activityId);
+    setMergePick({
+      customerId: resolveCustomerId(entries[0], activities.activities),
+      activityId: entries[0].activityId,
+    });
     setMergeDescription(entries.map(e => e.description).filter(Boolean).join(' / '));
     setMergeOpen(true);
   }
@@ -352,7 +351,8 @@ export default function TrackerPage() {
 
     await api.mergeEntries(currentDate, {
       entryIds: entries.map(e => e.id),
-      activityId: mergeActivityId,
+      customerId: mergePick.customerId,
+      activityId: mergePick.activityId,
       description: mergeDescription,
       useIndicated: entries.filter(e => mergeUseIndicated[e.id]).map(e => e.id),
     });
@@ -394,7 +394,10 @@ export default function TrackerPage() {
 
   function openEditModal(entry: TimesheetEntry) {
     setEditingEntry(entry);
-    setEditActivityId(entry.activityId);
+    setEditPick({
+      customerId: resolveCustomerId(entry, activities.activities),
+      activityId: entry.activityId,
+    });
     setEditDescription(entry.description);
     // Completed entries expose their rounded ("indiqué") duration; paused/active
     // ones expose the real elapsed time.
@@ -404,7 +407,12 @@ export default function TrackerPage() {
   async function saveEditModal() {
     if (!editingEntry) return;
     const updates: Record<string, unknown> = {};
-    if (editActivityId !== editingEntry.activityId) updates.activityId = editActivityId;
+    // Client and activity travel together: the server keeps the pair coherent.
+    const wasCustomerId = resolveCustomerId(editingEntry, activities.activities);
+    if (editPick.activityId !== editingEntry.activityId || editPick.customerId !== wasCustomerId) {
+      updates.activityId = editPick.activityId;
+      updates.customerId = editPick.customerId;
+    }
     if (editDescription !== editingEntry.description) updates.description = editDescription;
     const parsedMin = parseInt(editMinutes, 10);
     if (!isNaN(parsedMin)) {
@@ -535,11 +543,14 @@ export default function TrackerPage() {
                   <ClientActivityPicker
                     customers={customers.customers}
                     activities={activities.activities}
-                    activityId={entry.activityId}
+                    value={{
+                      customerId: resolveCustomerId(entry, activities.activities),
+                      activityId: entry.activityId,
+                    }}
                     showArchived={showArchived}
                     onDataChanged={refresh}
-                    onChange={async (activityId) => {
-                      await api.updateEntry(currentDate, entry.id, { activityId });
+                    onChange={async ({ customerId, activityId }) => {
+                      await api.updateEntry(currentDate, entry.id, { customerId, activityId });
                       await refresh(true);
                     }}
                   />
@@ -685,7 +696,7 @@ export default function TrackerPage() {
                       />
                     </TableCell>
                     <TableCell className="truncate text-muted-foreground">
-                      {resolveCustomerName(entry.activityId, activities.activities, customers.customers) || '—'}
+                      {resolveCustomerName(entry, activities.activities, customers.customers) || '—'}
                     </TableCell>
                     <TableCell className="truncate cursor-pointer" onClick={() => openEditModal(entry)}>
                       {activityNameOnly(entry, activities.activities) || '—'}
@@ -885,10 +896,10 @@ export default function TrackerPage() {
               <ClientActivityPicker
                 customers={customers.customers}
                 activities={activities.activities}
-                activityId={mergeActivityId}
+                value={mergePick}
                 showArchived={showArchived}
                 onDataChanged={refresh}
-                onChange={setMergeActivityId}
+                onChange={setMergePick}
               />
             </div>
 
@@ -924,10 +935,10 @@ export default function TrackerPage() {
               <ClientActivityPicker
                 customers={customers.customers}
                 activities={activities.activities}
-                activityId={editActivityId}
+                value={editPick}
                 showArchived={showArchived}
                 onDataChanged={refresh}
-                onChange={setEditActivityId}
+                onChange={setEditPick}
               />
             </div>
             <div className="space-y-1.5">

@@ -204,6 +204,26 @@ export class Storage {
     return false;
   }
 
+  /**
+   * Every activity and client id a recorded entry points at, in a single pass
+   * over the day files. An entry can name a client directly (no activity), so
+   * "is this client still in use?" cannot be answered from its activities
+   * alone. Soft-deleted entries count as users: they can be restored and would
+   * need their labels back.
+   */
+  async collectUsedIds(): Promise<{ activityIds: Set<string>; customerIds: Set<string> }> {
+    const activityIds = new Set<string>();
+    const customerIds = new Set<string>();
+    for (const date of await this.listDates()) {
+      const day = await this.loadTimesheet(date);
+      for (const entry of day.entries) {
+        if (entry.activityId) activityIds.add(entry.activityId);
+        if (entry.customerId) customerIds.add(entry.customerId);
+      }
+    }
+    return { activityIds, customerIds };
+  }
+
   /** The n most recent dates that have a day file, oldest first. */
   async recentDates(n: number): Promise<string[]> {
     const dates = await this.listDates();

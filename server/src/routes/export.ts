@@ -2,6 +2,7 @@ import { Router } from 'express';
 import type { Response } from 'express';
 import type { Storage } from '../storage.js';
 import type { TimesheetEntry } from '../types.js';
+import { resolveCustomerId } from '../types.js';
 import { toHHmm } from '../time-utils.js';
 
 export function createExportRouter(storage: Storage) {
@@ -71,7 +72,7 @@ function entryToCsvRow(
   date: string,
 ): string {
   const activity = activities.find((a) => a.id === entry.activityId);
-  const customer = activity ? customers.find((c) => c.id === activity.customerId) : undefined;
+  const customer = customers.find((c) => c.id === resolveCustomerId(entry, activities));
   const closed = entry.segments.filter((s) => s.end);
   const firstStart = entry.segments[0]?.start ? toHHmm(entry.segments[0].start) : '';
   const lastEnd = closed.length > 0 ? toHHmm(closed[closed.length - 1].end!) : '';

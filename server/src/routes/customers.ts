@@ -42,12 +42,13 @@ export function createCustomersRouter(storage: Storage) {
 
     const actData = await storage.loadActivities();
     const own = actData.activities.filter((a) => a.customerId === req.params.id);
-    const used: string[] = [];
-    for (const a of own) {
-      if (await storage.isActivityUsed(a.id)) used.push(a.id);
-    }
+    // One pass over the history instead of one per activity, and it also catches
+    // entries that name this client directly, with no activity at all.
+    const used = await storage.collectUsedIds();
+    const inUse = used.customerIds.has(req.params.id)
+      || own.some((a) => used.activityIds.has(a.id));
 
-    if (used.length > 0) {
+    if (inUse) {
       customer.archived = true;
       for (const a of own) a.archived = true;
       await storage.saveActivities(actData);

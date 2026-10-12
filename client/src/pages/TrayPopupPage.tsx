@@ -3,7 +3,9 @@ import type { TimesheetDay, TimesheetEntry, ActivitiesData, CustomersData } from
 import * as api from '../api';
 import * as desktop from '../desktop';
 import { Play, Pause, CircleStop, Trash2, Plus, X, Clock, ChevronLeft, Maximize2 } from 'lucide-react';
+import { resolveCustomerId } from '../types';
 import { ClientActivityPicker } from '../components/ClientActivityPicker';
+import type { ClientActivitySelection } from '../components/ClientActivityPicker';
 
 async function updateTrayTitle(text: string) {
   desktop.setTrayTitle(text);
@@ -54,20 +56,20 @@ function computeElapsedSeconds(entry: TimesheetEntry): number {
   return totalSec;
 }
 
+/** "Client - Activité", or whichever of the two is set: an entry can now carry
+ * a client on its own. Falls back to the start time when neither is. */
 function entryLabel(entry: TimesheetEntry, activities: ActivitiesData, customersList: { id: string; name: string }[]): string {
-  const activity = activities.activities.find(a => a.id === entry.activityId);
-  if (activity) return activityOptionLabel(activity, customersList);
+  const customerId = resolveCustomerId(entry, activities.activities);
+  const customerName = customersList.find(c => c.id === customerId)?.name ?? '';
+  const activityName = activities.activities.find(a => a.id === entry.activityId)?.name ?? '';
+  if (customerName && activityName) return `${customerName} - ${activityName}`;
+  if (customerName || activityName) return customerName || activityName;
   const startTime = entry.segments[0]?.start;
   if (startTime) {
     const d = parseTimestamp(startTime);
     return `Démarré à ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
   }
   return 'Timer';
-}
-
-function activityOptionLabel(activity: { name: string; customerId: string }, customersList: { id: string; name: string }[]): string {
-  const customer = customersList.find(c => c.id === activity.customerId);
-  return customer ? `${customer.name} - ${activity.name}` : activity.name;
 }
 
 // ---------------------------------------------------------------------------
@@ -102,7 +104,7 @@ export default function TrayPopupPage() {
 
   // Edit panel state
   const [editingEntry, setEditingEntry] = useState<TimesheetEntry | null>(null);
-  const [editActivityId, setEditActivityId] = useState('');
+  const [editPick, setEditPick] = useState<ClientActivitySelection>({ customerId: '', activityId: '' });
   const [editDescription, setEditDescription] = useState('');
 
   useEffect(() => {
@@ -233,14 +235,22 @@ export default function TrayPopupPage() {
 
   function openEdit(entry: TimesheetEntry) {
     setEditingEntry(entry);
-    setEditActivityId(entry.activityId);
+    setEditPick({
+      customerId: resolveCustomerId(entry, activities.activities),
+      activityId: entry.activityId,
+    });
     setEditDescription(entry.description);
   }
 
   async function saveEdit() {
     if (!editingEntry) return;
     const updates: Record<string, unknown> = {};
-    if (editActivityId !== editingEntry.activityId) updates.activityId = editActivityId;
+    // Client and activity travel together: the server keeps the pair coherent.
+    const wasCustomerId = resolveCustomerId(editingEntry, activities.activities);
+    if (editPick.activityId !== editingEntry.activityId || editPick.customerId !== wasCustomerId) {
+      updates.activityId = editPick.activityId;
+      updates.customerId = editPick.customerId;
+    }
     if (editDescription !== editingEntry.description) updates.description = editDescription;
     if (Object.keys(updates).length > 0) {
       setLoading(true);
@@ -290,10 +300,10 @@ export default function TrayPopupPage() {
             <ClientActivityPicker
               customers={customers.customers}
               activities={activities.activities}
-              activityId={editActivityId}
+              value={editPick}
               showArchived={showArchived}
               onDataChanged={refresh}
-              onChange={setEditActivityId}
+              onChange={setEditPick}
               className="grid grid-cols-1 gap-1.5"
             />
           </div>

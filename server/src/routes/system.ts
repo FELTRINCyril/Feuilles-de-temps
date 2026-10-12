@@ -210,6 +210,7 @@ export function createSystemRouter(storage: Storage) {
 
           continuations.push({
             id: uuid(),
+            customerId: entry.customerId,
             activityId: entry.activityId,
             description: entry.description,
             segments: [{ start: startOfDayIso(nextDate(target!)), end: null }],

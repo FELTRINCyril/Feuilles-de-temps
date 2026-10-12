@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import type { Storage } from '../storage.js';
+import { resolveCustomerId } from '../types.js';
 import { roundUp15, calcLiveTotalMinutes } from '../time-utils.js';
 
 export function createStatsRouter(storage: Storage) {
@@ -38,13 +39,12 @@ export function createStatsRouter(storage: Storage) {
         totalRounded += minutes;
         dayMinutes += minutes;
 
-        if (entry.activityId) {
-          activityAgg[entry.activityId] = (activityAgg[entry.activityId] || 0) + minutes;
-          const act = activities.activities.find(a => a.id === entry.activityId);
-          if (act?.customerId) {
-            customerAgg[act.customerId] = (customerAgg[act.customerId] || 0) + minutes;
-          }
-        }
+        // Every minute lands in exactly one client bucket and one activity
+        // bucket, '' standing for "not set". Skipping unlabelled entries here
+        // used to leave the breakdowns silently short of the headline total.
+        const customerId = resolveCustomerId(entry, activities.activities);
+        customerAgg[customerId] = (customerAgg[customerId] || 0) + minutes;
+        activityAgg[entry.activityId] = (activityAgg[entry.activityId] || 0) + minutes;
       }
 
       if (dayMinutes > 0) {
@@ -53,11 +53,13 @@ export function createStatsRouter(storage: Storage) {
     }
 
     const byCustomer = Object.entries(customerAgg).map(([id, minutes]) => {
+      if (!id) return { id, name: 'Sans client', type: '', minutes };
       const c = customers.customers.find(cu => cu.id === id);
       return { id, name: c?.name ?? id, type: c?.type ?? '', minutes };
     }).sort((a, b) => b.minutes - a.minutes);
 
     const byActivity = Object.entries(activityAgg).map(([id, minutes]) => {
+      if (!id) return { id, name: 'Sans activité', customerName: '', minutes };
       const a = activities.activities.find(act => act.id === id);
       const c = a ? customers.customers.find(cu => cu.id === a.customerId) : undefined;
       return { id, name: a?.name ?? id, customerName: c?.name ?? '', minutes };

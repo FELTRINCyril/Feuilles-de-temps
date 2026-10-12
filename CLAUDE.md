@@ -58,7 +58,7 @@ cd server && npx vitest src/__tests__/timesheet.test.ts
 
 - **Customers:** `{ id, name, type: 'interne'|'externe', archived? }` in `customers.json`
 - **Activities:** `{ id, name, customerId, archived? }` in `activities.json` (migrated from the legacy `projects.json`)
-- **Timesheet entries:** `{ id, activityId, description, segments: [{ start, end }], totalMinutes, roundedMinutes, status: 'active'|'paused'|'completed', deferred?, deleted?, autoPausedAt?, autoPauseReason?, recoveredAt?, splitAtMidnight?, continuedFrom? }`
+- **Timesheet entries:** `{ id, customerId?, activityId, description, segments: [{ start, end }], totalMinutes, roundedMinutes, status: 'active'|'paused'|'completed', deferred?, deleted?, autoPausedAt?, autoPauseReason?, recoveredAt?, splitAtMidnight?, continuedFrom? }`
 - **Day file:** `{ date, entries[], activeEntries: id[], pausedEntries: id[] }`
 - **`runtime.json`:** `{ lastSeenAt }` — heartbeat written every 30 s by the Electron main process
 
@@ -67,6 +67,20 @@ cd server && npx vitest src/__tests__/timesheet.test.ts
 - Time rounded up to nearest 15 minutes on completion
 - Multiple timers can run simultaneously; pause/resume is manual (no automatic LIFO stack)
 - Timer survives browser refresh (computed from stored timestamps, not intervals)
+
+### An entry owns its client
+
+`customerId` lives on the entry, not only on its activity. An entry can carry a
+client with no activity at all (that combination used to save nothing), and
+re-pointing an activity at another client no longer rewrites the client of every
+past entry that used it. The two must stay coherent: the PATCH/POST routes pin
+the client to the chosen activity, and drop an activity that belongs to somebody
+else. Entries written before the field exists have no `customerId` — read it
+through `resolveCustomerId(entry, activities)` (in `types.ts`, duplicated
+client-side) in every read path, never by looking the activity up directly.
+
+Because of this, "is this client still used?" cannot be answered from its
+activities alone: use `storage.collectUsedIds()`.
 
 ### Nothing is ever destroyed
 

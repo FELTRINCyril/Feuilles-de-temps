@@ -2,7 +2,24 @@ import { Router } from 'express';
 import { v4 as uuid } from 'uuid';
 import type { Storage } from '../storage.js';
 import type { TimesheetEntry } from '../types.js';
+import { resolveCustomerId } from '../types.js';
 import { nowTimestamp, calcTotalMinutes, roundUp15 } from '../time-utils.js';
+
+/**
+ * Keep the entry's client and activity coherent: an activity belongs to exactly
+ * one client, so picking one pins the other. Only a bare client (no activity
+ * chosen yet) stands on its own — which is the whole point of storing the
+ * client on the entry.
+ *
+ * Resolved before taking the day-file lock, never inside withTimesheet.
+ */
+async function ownerOf(storage: Storage, activityId: string, fallback: string): Promise<string> {
+  if (!activityId) return fallback;
+  const { activities } = await storage.loadActivities();
+  return activities.find((a) => a.id === activityId)?.customerId || fallback;
+}
+
+const asString = (v: unknown): string => (typeof v === 'string' ? v : '');
 
 export function createTimesheetRouter(storage: Storage) {
   const router = Router();
@@ -13,12 +30,14 @@ export function createTimesheetRouter(storage: Storage) {
   });
 
   router.post('/:date/entries', async (req, res) => {
-    const { activityId = '', description = '' } = req.body;
+    const activityId = asString(req.body.activityId);
+    const customerId = await ownerOf(storage, activityId, asString(req.body.customerId));
 
     const entry: TimesheetEntry = {
       id: uuid(),
-      activityId: typeof activityId === 'string' ? activityId : '',
-      description: typeof description === 'string' ? description : '',
+      customerId,
+      activityId,
+      description: asString(req.body.description),
       segments: [{ start: nowTimestamp(), end: null }],
       totalMinutes: 0,
       roundedMinutes: 0,
@@ -33,6 +52,13 @@ export function createTimesheetRouter(storage: Storage) {
   });
 
   router.patch('/:date/entries/:id', async (req, res) => {
+    const setsActivity = typeof req.body.activityId === 'string';
+    const setsCustomer = typeof req.body.customerId === 'string';
+    // Read outside the day-file lock: withTimesheet holds it for the whole callback.
+    const activities = setsActivity || setsCustomer
+      ? (await storage.loadActivities()).activities
+      : [];
+
     let found = false;
     const data = await storage.withTimesheet(req.params.date, (d) => {
       const entry = d.entries.find((e) => e.id === req.params.id);
@@ -53,8 +79,23 @@ export function createTimesheetRouter(storage: Storage) {
       }
 
       if (typeof req.body.description === 'string') entry.description = req.body.description;
-      if (typeof req.body.activityId === 'string') entry.activityId = req.body.activityId;
       if (req.body.deferred !== undefined) entry.deferred = !!req.body.deferred;
+
+      if (setsActivity || setsCustomer) {
+        const nextActivityId = setsActivity ? req.body.activityId : entry.activityId;
+        const activity = activities.find((a) => a.id === nextActivityId);
+        // An explicit client in the request wins — it is what the user just
+        // picked. Failing that the activity pins its own client, and failing
+        // that the entry keeps the client it already had.
+        const nextCustomerId = setsCustomer
+          ? req.body.customerId
+          : activity?.customerId || resolveCustomerId(entry, activities);
+        // An activity belonging to somebody else would make the pair lie about
+        // itself, so the client wins and the activity is dropped.
+        const activityFits = !activity || !activity.customerId || activity.customerId === nextCustomerId;
+        entry.activityId = activityFits ? nextActivityId : '';
+        entry.customerId = nextCustomerId;
+      }
 
       if (req.body.roundedMinutes !== undefined) {
         const rounded = Math.round(Number(req.body.roundedMinutes));
@@ -209,11 +250,14 @@ export function createTimesheetRouter(storage: Storage) {
   // Merge: create a completed entry that keeps the real time span of the
   // originals, and soft-delete the originals so the merge can be undone.
   router.post('/:date/entries/merge', async (req, res) => {
-    const { entryIds, activityId, description } = req.body;
+    const { entryIds, description } = req.body;
 
     if (!Array.isArray(entryIds) || entryIds.length < 2) {
       return res.status(400).json({ error: 'Need at least 2 entry IDs' });
     }
+
+    const activityId = asString(req.body.activityId);
+    const customerId = await ownerOf(storage, activityId, asString(req.body.customerId));
 
     let error: string | null = null;
     const data = await storage.withTimesheet(req.params.date, (d) => {
@@ -242,7 +286,8 @@ export function createTimesheetRouter(storage: Storage) {
 
       const merged: TimesheetEntry = {
         id: uuid(),
-        activityId: typeof activityId === 'string' ? activityId : '',
+        customerId,
+        activityId,
         description: typeof description === 'string' ? description : '',
         segments: [{ start, end }],
         totalMinutes: total,
